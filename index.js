@@ -463,7 +463,7 @@ app.post('/api/auth/set-password', authRateLimiter, async (req, res, next) => {
 
 app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order'], paymentLimiter, async (req, res, next) => {
   try {
-    const { courseId, batchId, paymentPlan = "FULL", name, email, phone, returnUrl } = req.body;
+    const { courseId, batchId, paymentPlan = "FULL", couponCode = "", name, email, phone, returnUrl } = req.body;
     const studentName = name || req.body.studentName || "Student";
     const studentEmail = email || req.body.email;
 
@@ -535,8 +535,21 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
     }
 
     // Phase 13: Authoritative Server-Side Payment Calculation
-    const totalCoursePrice = Number(course.price || 4000);
-    const configuredInstallmentPrice = Number(course.installment_price || 1500);
+    const rawPrice = Number(course.price);
+    let totalCoursePrice = (!isNaN(rawPrice) && rawPrice >= 4000) ? rawPrice : 4000;
+
+    const rawInst = Number(course.installment_price);
+    let configuredInstallmentPrice = (!isNaN(rawInst) && rawInst > 0 && rawInst < totalCoursePrice) ? rawInst : 1500;
+
+    // Validate Coupon Discount (Support secret code: 17/07/26-INLS, EARLY2026, NETRA15)
+    const cleanCoupon = String(couponCode || "").trim().toUpperCase();
+    const VALID_COUPONS = ["17/07/26-INLS", "EARLY2026", "NETRA15"];
+    const isCouponValid = VALID_COUPONS.includes(cleanCoupon);
+    const discountAmount = isCouponValid ? 500 : 0;
+
+    totalCoursePrice = Math.max(0, totalCoursePrice - discountAmount);
+    configuredInstallmentPrice = Math.max(0, configuredInstallmentPrice - discountAmount);
+
     const orderAmount = paymentPlan === "INSTALLMENT" ? configuredInstallmentPrice : totalCoursePrice;
 
     // Fetch Batch & Validate Capacity
