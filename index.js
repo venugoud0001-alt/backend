@@ -506,7 +506,7 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
       const courseTitle = requestedCourseName || (courseId ? `Program ${courseId}` : "Live Upskilling Program");
       const clientAmount = Number(req.body.amount || req.body.totalFee);
       const fallbackPrice = (!isNaN(clientAmount) && clientAmount > 0) ? clientAmount : 4000;
-      const fallbackInstallment = Math.round(fallbackPrice / 2) || 1500;
+      const fallbackInstallment = 1500;
       const generatedSlug = (courseId || courseTitle).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 
       try {
@@ -538,8 +538,7 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
     const rawPrice = Number(course.price);
     let totalCoursePrice = (!isNaN(rawPrice) && rawPrice >= 4000) ? rawPrice : 4000;
 
-    const rawInst = Number(course.installment_price);
-    let configuredInstallmentPrice = (!isNaN(rawInst) && rawInst > 0 && rawInst < totalCoursePrice) ? rawInst : 1500;
+    let configuredInstallmentPrice = 1500;
 
     // Validate Coupon Discount (Support secret code: 17/07/26-INLS, EARLY2026, NETRA15)
     const cleanCoupon = String(couponCode || "").trim().toUpperCase();
@@ -550,7 +549,13 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
     totalCoursePrice = Math.max(0, totalCoursePrice - discountAmount);
     configuredInstallmentPrice = Math.max(0, configuredInstallmentPrice - discountAmount);
 
-    const orderAmount = paymentPlan === "INSTALLMENT" ? configuredInstallmentPrice : totalCoursePrice;
+    const clientAmount = Number(req.body.amount);
+    let orderAmount;
+    if (!isNaN(clientAmount) && clientAmount > 0 && (clientAmount === configuredInstallmentPrice || clientAmount === totalCoursePrice)) {
+      orderAmount = clientAmount;
+    } else {
+      orderAmount = paymentPlan === "INSTALLMENT" ? configuredInstallmentPrice : totalCoursePrice;
+    }
 
     // Fetch Batch & Validate Capacity
     let batch = null;
