@@ -812,23 +812,42 @@ app.post(['/api/payments/sync-order', '/api/admin/sync-order'], async (req, res,
     }
 
     const customer = cfOrderData.customer_details || {};
-    const studentEmail = (customer.customer_email || "").toLowerCase().trim();
-    const studentName = customer.customer_name || "Enrolled Student";
-    const studentPhone = customer.customer_phone || "";
+    let studentEmail = (customer.customer_email || "").toLowerCase().trim();
+    let studentName = customer.customer_name || "";
+    let studentPhone = customer.customer_phone || "";
+    let courseName = (cfOrderData.order_note || "").replace("Enrollment - ", "").replace("Registration Token - ", "").trim();
+
+    // Look up existing database record for true student identity & course name
+    try {
+      const { data: existingPreOrder } = await supabase
+        .from("payments")
+        .select("student_name, email, mobile, course_name")
+        .eq("txn_id", String(orderId))
+        .maybeSingle();
+
+      if (existingPreOrder) {
+        if (!studentName && existingPreOrder.student_name) studentName = existingPreOrder.student_name;
+        if (!studentEmail && existingPreOrder.email) studentEmail = existingPreOrder.email;
+        if (!studentPhone && existingPreOrder.mobile) studentPhone = existingPreOrder.mobile;
+        if (!courseName && existingPreOrder.course_name) courseName = existingPreOrder.course_name;
+      }
+    } catch (dbLookupErr) {
+      console.warn("Sync order db lookup note:", dbLookupErr.message);
+    }
+
     const amountPaid = Number(cfOrderData.order_amount) || 0;
     const totalFee = Number(cfOrderData.order_meta?.total_fee || amountPaid) || amountPaid;
     const remainingBal = Math.max(0, totalFee - amountPaid);
-    const courseName = (cfOrderData.order_note || "").replace("Enrollment - ", "").replace("Registration Token - ", "") || "Live Program";
     const isPaid = cfOrderData.order_status === "PAID";
     const cfTxnId = cfOrderData.cf_order_id ? String(cfOrderData.cf_order_id) : `CF_${orderId}`;
 
     // Insert/Upsert directly using Supabase Service Role Key
     const { data: pmtData, error: pmtErr } = await supabase.from("payments").upsert([{
       txn_id: orderId,
-      student_name: studentName,
-      email: studentEmail,
-      mobile: studentPhone,
-      course_name: courseName,
+      student_name: studentName || "Student",
+      email: studentEmail || "",
+      mobile: studentPhone || "",
+      course_name: courseName || "Enrolled Program",
       payment_type: remainingBal <= 0 ? "FULL" : "INSTALLMENT",
       amount_paid: isPaid ? amountPaid : 0,
       total_course_fee: totalFee,
@@ -924,8 +943,27 @@ app.post('/api/payments/reconcile-order', authenticateJWT, paymentLimiter, async
 
     // 3. Invoke Atomic RPC for Transactional Safety
     const customerObj = cfOrderData.customer_details || {};
-    const email = (customerObj.customer_email || req.user?.email || 'student@internnetra.com').toLowerCase().trim();
-    const studentName = customerObj.customer_name || 'Enrolled Student';
+    let email = (customerObj.customer_email || req.user?.email || '').toLowerCase().trim();
+    let studentName = customerObj.customer_name || '';
+
+    try {
+      const { data: existingPreOrder } = await supabase
+        .from("payments")
+        .select("student_name, email")
+        .eq("txn_id", String(orderId))
+        .maybeSingle();
+
+      if (existingPreOrder) {
+        if (!studentName && existingPreOrder.student_name) studentName = existingPreOrder.student_name;
+        if (!email && existingPreOrder.email) email = existingPreOrder.email;
+      }
+    } catch (lookupErr) {
+      console.warn("Reconcile lookup note:", lookupErr.message);
+    }
+
+    if (!studentName) studentName = "Student";
+    if (!email) email = "";
+
     const amountPaid = Number(cfOrderData.order_amount) || Number(internalOrder.amount);
     const cashfreePaymentId = cfOrderData.cf_order_id ? String(cfOrderData.cf_order_id) : `CF_RECON_${orderId}`;
 
@@ -1172,22 +1210,45 @@ app.post('/api/webhooks/cashfree', async (req, res) => {
     }
 
     const customerObj = cfOrderData.customer_details || {};
-    const email = (customerObj.customer_email || 'student@internnetra.com').toLowerCase().trim();
-    const studentName = customerObj.customer_name || 'Enrolled Student';
+    let email = (customerObj.customer_email || '').toLowerCase().trim();
+    let studentName = customerObj.customer_name || '';
+    let mobile = customerObj.customer_phone || '';
+    let courseTitle = (cfOrderData.order_note || "").replace("Enrollment - ", "").replace("Registration Token - ", "").trim();
     const amountPaid = Number(cfOrderData.order_amount) || 0;
+
+    // Look up real pre-order student details from database if available
+    try {
+      const { data: existingPreOrder } = await supabase
+        .from("payments")
+        .select("student_name, email, mobile, course_name")
+        .eq("txn_id", String(cashfreeOrderId))
+        .maybeSingle();
+
+      if (existingPreOrder) {
+        if (!studentName && existingPreOrder.student_name) studentName = existingPreOrder.student_name;
+        if (!email && existingPreOrder.email) email = existingPreOrder.email;
+        if (!mobile && existingPreOrder.mobile) mobile = existingPreOrder.mobile;
+        if (!courseTitle && existingPreOrder.course_name) courseTitle = existingPreOrder.course_name;
+      }
+    } catch (lookupErr) {
+      console.warn("Pre-order lookup note:", lookupErr.message);
+    }
+
+    if (!studentName) studentName = "Enrolled Student";
+    if (!email) email = "student@internnetra.com";
+    if (!courseTitle) courseTitle = "Live Program";
 
     // Unconditional Automatic Database Sync for Every Paid Cashfree Event
     try {
       const totalFee = Number(cfOrderData.order_meta?.total_fee || amountPaid) || amountPaid;
       const remainingBal = Math.max(0, totalFee - amountPaid);
-      const courseTitle = (cfOrderData.order_note || "").replace("Enrollment - ", "").replace("Registration Token - ", "") || "Live Program";
 
       await supabase.from("payments").upsert([{
         txn_id: String(cashfreeOrderId),
         cashfree_payment_id: String(cashfreePaymentId),
         student_name: studentName,
         email: email,
-        mobile: customerObj.customer_phone || "",
+        mobile: mobile,
         course_name: courseTitle,
         amount_paid: amountPaid,
         total_course_fee: totalFee,
