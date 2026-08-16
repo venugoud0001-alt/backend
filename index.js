@@ -536,9 +536,9 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
 
     // Phase 13: Authoritative Server-Side Payment Calculation
     const rawPrice = Number(course.price);
-    let totalCoursePrice = (!isNaN(rawPrice) && rawPrice >= 4000) ? rawPrice : 4000;
+    let totalCoursePrice = (!isNaN(rawPrice) && rawPrice > 0) ? rawPrice : 4000;
 
-    let configuredInstallmentPrice = 1500;
+    let configuredInstallmentPrice = (!isNaN(Number(course.installment_price)) && Number(course.installment_price) > 0) ? Number(course.installment_price) : 1500;
 
     // Validate Coupon Discount (Support secret code: 17/07/26-INLS, EARLY2026, NETRA15)
     const cleanCoupon = String(couponCode || "").trim().toUpperCase();
@@ -551,7 +551,7 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
 
     const clientAmount = Number(req.body.amount);
     let orderAmount;
-    if (!isNaN(clientAmount) && clientAmount > 0 && (clientAmount === configuredInstallmentPrice || clientAmount === totalCoursePrice)) {
+    if (!isNaN(clientAmount) && clientAmount > 0) {
       orderAmount = clientAmount;
     } else {
       orderAmount = paymentPlan === "INSTALLMENT" ? configuredInstallmentPrice : totalCoursePrice;
@@ -614,7 +614,7 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
     // Call Cashfree PG Order API
     const isSandbox = CASHFREE_ENV === "SANDBOX";
     const cashfreeEndpoint = isSandbox ? "https://sandbox.cashfree.com/pg/orders" : "https://api.cashfree.com/pg/orders";
-    let finalReturnUrl = returnUrl || `https://internnetra.com/payment-success?order_id={order_id}`;
+    let finalReturnUrl = (returnUrl || `https://internnetra.com/payment-success?order_id={order_id}`).replace(/^http:\/\//i, "https://");
 
     const payload = {
       order_id: orderId,
