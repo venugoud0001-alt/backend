@@ -850,6 +850,35 @@ app.post(['/api/payments/sync-order', '/api/admin/sync-order'], async (req, res,
   }
 });
 
+// Admin Endpoint: Consolidated Payment Ledger with Service Role Access (Bypasses RLS)
+app.get(['/api/admin/payments', '/api/payments/admin-ledger'], async (req, res, next) => {
+  try {
+    const { data: paymentsData } = await supabase
+      .from('payments')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    const { data: ordersData } = await supabase
+      .from('orders')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    const { data: enrollmentsData } = await supabase
+      .from('enrollments')
+      .select('*, students(full_name, email, phone)')
+      .order('updated_at', { ascending: false });
+
+    res.status(200).json({
+      status: 'SUCCESS',
+      payments: paymentsData || [],
+      orders: ordersData || [],
+      enrollments: enrollmentsData || []
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Authoritative Backend-Only Payment Reconciliation Endpoint
 app.post('/api/payments/reconcile-order', authenticateJWT, paymentLimiter, async (req, res, next) => {
   try {
