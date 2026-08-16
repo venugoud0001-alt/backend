@@ -540,11 +540,14 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
 
     let configuredInstallmentPrice = (!isNaN(Number(course.installment_price)) && Number(course.installment_price) > 0) ? Number(course.installment_price) : 1500;
 
-    // Validate Coupon Discount (Support secret code: 17/07/26-INLS, EARLY2026, NETRA15)
+    // Validate Coupon Discount (Support secret codes: 16/08/26-INLS for ₹1000 off; 17/07/26-INLS, EARLY2026, NETRA15 for ₹500 off)
     const cleanCoupon = String(couponCode || "").trim().toUpperCase();
-    const VALID_COUPONS = ["17/07/26-INLS", "EARLY2026", "NETRA15"];
-    const isCouponValid = VALID_COUPONS.includes(cleanCoupon);
-    const discountAmount = isCouponValid ? 500 : 0;
+    let discountAmount = 0;
+    if (cleanCoupon === "16/08/26-INLS") {
+      discountAmount = 1000;
+    } else if (["17/07/26-INLS", "EARLY2026", "NETRA15"].includes(cleanCoupon)) {
+      discountAmount = 500;
+    }
 
     totalCoursePrice = Math.max(0, totalCoursePrice - discountAmount);
     configuredInstallmentPrice = Math.max(0, configuredInstallmentPrice - discountAmount);
@@ -610,6 +613,26 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
       installment_number: 1,
       status: "CREATED"
     }]);
+
+    try {
+      await supabase.from('payments').upsert([{
+        txn_id: orderId,
+        student_name: studentName,
+        email: normalizedEmail,
+        mobile: cleanPhone,
+        course_name: course.title,
+        payment_type: paymentPlan,
+        amount_paid: orderAmount,
+        total_course_fee: totalCoursePrice,
+        remaining_balance: Math.max(0, totalCoursePrice - orderAmount),
+        batch_start_date: req.body.batchStartDate || "October 1, 2026",
+        payment_method: "Cashfree Production Gateway",
+        status: paymentPlan === "INSTALLMENT" ? "1st Installment Initiated" : "Full Payment Initiated",
+        created_at: new Date().toISOString()
+      }], { onConflict: "txn_id" });
+    } catch (pmtErr) {
+      console.warn("Pre-payment server insert note:", pmtErr.message);
+    }
 
     // Call Cashfree PG Order API
     const isSandbox = CASHFREE_ENV === "SANDBOX";
@@ -694,11 +717,133 @@ app.post(['/api/payments/verify-order', '/api/payments/verify'], async (req, res
     }
 
     const isPaid = cfOrderData.order_status === "PAID";
+
+    if (isPaid) {
+      try {
+        const customer = cfOrderData.customer_details || {};
+        const studentEmail = (customer.customer_email || "").toLowerCase().trim();
+        const studentName = customer.customer_name || "Enrolled Student";
+        const studentPhone = customer.customer_phone || "";
+        const amountPaid = Number(cfOrderData.order_amount) || 0;
+        const totalFee = Number(cfOrderData.order_meta?.total_fee || amountPaid) || amountPaid;
+        const remainingBal = Math.max(0, totalFee - amountPaid);
+        const courseName = (cfOrderData.order_note || "").replace("Enrollment - ", "").replace("Registration Token - ", "") || "Live Program";
+        const txnId = cfOrderData.cf_order_id ? String(cfOrderData.cf_order_id) : `CF_${orderId}`;
+
+        // 1. Sync to Supabase Payments Table
+        await supabase.from("payments").upsert([{
+          txn_id: txnId,
+          student_name: studentName,
+          email: studentEmail,
+          mobile: studentPhone,
+          course_name: courseName,
+          payment_type: remainingBal <= 0 ? "FULL" : "INSTALLMENT",
+          amount_paid: amountPaid,
+          total_course_fee: totalFee,
+          remaining_balance: remainingBal,
+          payment_method: "Cashfree PG",
+          status: remainingBal <= 0 ? "Full Payment Settled" : "1st Installment Settled",
+          created_at: new Date().toISOString()
+        }], { onConflict: "txn_id" });
+
+        // 2. Sync to Supabase Orders Table
+        await supabase.from("orders").update({
+          status: "PAID",
+          amount: amountPaid
+        }).eq("cashfree_order_id", orderId);
+
+        // 3. Sync to Supabase Enrollments Table
+        const { data: matchedOrder } = await supabase
+          .from("orders")
+          .select("enrollment_id")
+          .eq("cashfree_order_id", orderId)
+          .maybeSingle();
+
+        if (matchedOrder?.enrollment_id) {
+          await supabase.from("enrollments").update({
+            payment_status: "PAID",
+            amount_paid: amountPaid,
+            amount_pending: remainingBal,
+            course_access_status: "UNLOCKED",
+            account_status: "ACTIVE"
+          }).eq("id", matchedOrder.enrollment_id);
+        }
+      } catch (syncErr) {
+        console.warn("Auto-sync Cashfree payment note:", syncErr.message);
+      }
+    }
+
     res.status(200).json({
       status: 'SUCCESS',
       isPaid,
       orderStatus: cfOrderData.order_status,
       data: cfOrderData
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin Endpoint: Sync specific Cashfree Order ID directly into Supabase database
+app.post(['/api/payments/sync-order', '/api/admin/sync-order'], async (req, res, next) => {
+  try {
+    const { orderId } = req.body;
+    if (!orderId) {
+      return res.status(400).json({ status: 'ERROR', message: 'orderId is required.' });
+    }
+
+    const isSandbox = CASHFREE_ENV === "SANDBOX";
+    const verifyApiUrl = isSandbox
+      ? `https://sandbox.cashfree.com/pg/orders/${orderId}`
+      : `https://api.cashfree.com/pg/orders/${orderId}`;
+
+    const cfVerifyRes = await fetch(verifyApiUrl, {
+      method: "GET",
+      headers: {
+        "x-api-version": "2023-08-01",
+        "x-client-id": CASHFREE_CLIENT_ID,
+        "x-client-secret": CASHFREE_CLIENT_SECRET,
+      },
+    });
+
+    const cfOrderData = await cfVerifyRes.json();
+    if (!cfVerifyRes.ok) {
+      return res.status(400).json({ status: 'ERROR', message: cfOrderData.message || 'Order not found in Cashfree.' });
+    }
+
+    const customer = cfOrderData.customer_details || {};
+    const studentEmail = (customer.customer_email || "").toLowerCase().trim();
+    const studentName = customer.customer_name || "Enrolled Student";
+    const studentPhone = customer.customer_phone || "";
+    const amountPaid = Number(cfOrderData.order_amount) || 0;
+    const totalFee = Number(cfOrderData.order_meta?.total_fee || amountPaid) || amountPaid;
+    const remainingBal = Math.max(0, totalFee - amountPaid);
+    const courseName = (cfOrderData.order_note || "").replace("Enrollment - ", "").replace("Registration Token - ", "") || "Live Program";
+    const isPaid = cfOrderData.order_status === "PAID";
+    const cfTxnId = cfOrderData.cf_order_id ? String(cfOrderData.cf_order_id) : `CF_${orderId}`;
+
+    // Insert/Upsert directly using Supabase Service Role Key
+    const { data: pmtData, error: pmtErr } = await supabase.from("payments").upsert([{
+      txn_id: orderId,
+      student_name: studentName,
+      email: studentEmail,
+      mobile: studentPhone,
+      course_name: courseName,
+      payment_type: remainingBal <= 0 ? "FULL" : "INSTALLMENT",
+      amount_paid: isPaid ? amountPaid : 0,
+      total_course_fee: totalFee,
+      remaining_balance: remainingBal,
+      payment_method: "Cashfree PG",
+      status: isPaid ? (remainingBal <= 0 ? "Full Payment Settled" : "1st Installment Settled") : "Payment Initiated",
+      created_at: new Date().toISOString()
+    }], { onConflict: "txn_id" }).select().single();
+
+    if (pmtErr) throw pmtErr;
+
+    res.status(200).json({
+      status: 'SUCCESS',
+      message: `Order ${orderId} synced to database successfully!`,
+      data: pmtData
     });
   } catch (err) {
     next(err);
@@ -1001,6 +1146,33 @@ app.post('/api/webhooks/cashfree', async (req, res) => {
     const email = (customerObj.customer_email || 'student@internnetra.com').toLowerCase().trim();
     const studentName = customerObj.customer_name || 'Enrolled Student';
     const amountPaid = Number(cfOrderData.order_amount) || 0;
+
+    // Unconditional Automatic Database Sync for Every Paid Cashfree Event
+    try {
+      const totalFee = Number(cfOrderData.order_meta?.total_fee || amountPaid) || amountPaid;
+      const remainingBal = Math.max(0, totalFee - amountPaid);
+      const courseTitle = (cfOrderData.order_note || "").replace("Enrollment - ", "").replace("Registration Token - ", "") || "Live Program";
+
+      await supabase.from("payments").upsert([{
+        txn_id: String(cashfreeOrderId),
+        cashfree_payment_id: String(cashfreePaymentId),
+        student_name: studentName,
+        email: email,
+        mobile: customerObj.customer_phone || "",
+        course_name: courseTitle,
+        amount_paid: amountPaid,
+        total_course_fee: totalFee,
+        remaining_balance: remainingBal,
+        payment_type: remainingBal <= 0 ? "FULL" : "INSTALLMENT",
+        payment_method: "Cashfree PG",
+        status: remainingBal <= 0 ? "Full Payment Settled" : "1st Installment Settled",
+        created_at: new Date().toISOString()
+      }], { onConflict: "txn_id" });
+
+      await supabase.from("orders").update({ status: "PAID", amount: amountPaid }).eq("cashfree_order_id", cashfreeOrderId);
+    } catch (syncErr) {
+      console.warn("Unconditional webhook sync note:", syncErr.message);
+    }
 
     // Attempt atomic database RPC call for transactional safety under concurrent webhooks (Phase 17)
     const { data: rpcResult, error: rpcError } = await supabase.rpc('process_payment_webhook', {
