@@ -504,8 +504,8 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
     // Resilient Auto-Creation / Fallback to prevent 404 on unseeded courses
     if (!course) {
       const courseTitle = requestedCourseName || (courseId ? `Program ${courseId}` : "Live Upskilling Program");
-      const clientAmount = Number(req.body.amount || req.body.totalFee);
-      const fallbackPrice = (!isNaN(clientAmount) && clientAmount > 0) ? clientAmount : 4000;
+      const clientTotalFee = Number(req.body.totalFee || req.body.fullPrice || req.body.coursePrice);
+      const fallbackPrice = (!isNaN(clientTotalFee) && clientTotalFee > 1500) ? clientTotalFee : 4000;
       const fallbackInstallment = 1500;
       const generatedSlug = (courseId || courseTitle).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 
@@ -536,9 +536,8 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
 
     // Phase 13: Authoritative Server-Side Payment Calculation
     const rawPrice = Number(course.price);
-    let totalCoursePrice = (!isNaN(rawPrice) && rawPrice > 0) ? rawPrice : 4000;
-
-    let configuredInstallmentPrice = (!isNaN(Number(course.installment_price)) && Number(course.installment_price) > 0) ? Number(course.installment_price) : 1500;
+    // Sanitize in case price stored in DB was <= 1500 (e.g. erroneously saved installment fee)
+    let totalCoursePrice = (!isNaN(rawPrice) && rawPrice > 1500) ? rawPrice : 4000;
 
     // Validate Coupon Discount (Support secret codes: 16/08/26-INLS for ₹1000 off; 17/07/26-INLS, EARLY2026, NETRA15 for ₹500 off)
     const cleanCoupon = String(couponCode || "").trim().toUpperCase();
@@ -550,14 +549,27 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
     }
 
     totalCoursePrice = Math.max(0, totalCoursePrice - discountAmount);
-    configuredInstallmentPrice = Math.max(0, configuredInstallmentPrice - discountAmount);
 
-    const clientAmount = Number(req.body.amount);
-    let orderAmount;
-    if (!isNaN(clientAmount) && clientAmount > 0) {
-      orderAmount = clientAmount;
-    } else {
-      orderAmount = paymentPlan === "INSTALLMENT" ? configuredInstallmentPrice : totalCoursePrice;
+    // Installment Rules:
+    // With Offer Coupon (₹500 or ₹1,000 off): 1st Installment = ₹1,000
+    // Without Coupon: 1st Installment = ₹1,500
+    let configuredInstallmentPrice = discountAmount > 0 ? 1000 : 1500;
+
+    let orderAmount = paymentPlan === "INSTALLMENT"
+      ? Math.min(totalCoursePrice, configuredInstallmentPrice)
+      : totalCoursePrice;
+
+    // Honor explicit positive client amount if passed as valid number
+    if (req.body.amount !== undefined && req.body.amount !== null && req.body.amount !== "") {
+      const parsedAmount = Number(String(req.body.amount).replace(/[^0-9.]/g, ""));
+      if (!isNaN(parsedAmount) && parsedAmount > 0) {
+        orderAmount = parsedAmount;
+      }
+    }
+
+    orderAmount = Math.round(Number(orderAmount));
+    if (isNaN(orderAmount) || orderAmount <= 0) {
+      orderAmount = paymentPlan === "INSTALLMENT" ? 1500 : 4000;
     }
 
     // Fetch Batch & Validate Capacity
@@ -652,6 +664,7 @@ app.post(['/api/payments/create-enrollment-order', '/api/payments/create-order']
       order_meta: {
         return_url: finalReturnUrl,
         notify_url: CASHFREE_WEBHOOK_URL,
+        total_fee: String(totalCoursePrice),
       },
       order_note: `Enrollment - ${course.title.slice(0, 30)}`,
     };
@@ -725,47 +738,57 @@ app.post(['/api/payments/verify-order', '/api/payments/verify'], async (req, res
         const studentName = customer.customer_name || "Enrolled Student";
         const studentPhone = customer.customer_phone || "";
         const amountPaid = Number(cfOrderData.order_amount) || 0;
-        const totalFee = Number(cfOrderData.order_meta?.total_fee || amountPaid) || amountPaid;
-        const remainingBal = Math.max(0, totalFee - amountPaid);
         const courseName = (cfOrderData.order_note || "").replace("Enrollment - ", "").replace("Registration Token - ", "") || "Live Program";
         const txnId = cfOrderData.cf_order_id ? String(cfOrderData.cf_order_id) : `CF_${orderId}`;
 
-        // 1. Sync to Supabase Payments Table
-        await supabase.from("payments").upsert([{
-          txn_id: txnId,
-          student_name: studentName,
-          email: studentEmail,
-          mobile: studentPhone,
-          course_name: courseName,
-          payment_type: remainingBal <= 0 ? "FULL" : "INSTALLMENT",
-          amount_paid: amountPaid,
-          total_course_fee: totalFee,
-          remaining_balance: remainingBal,
-          payment_method: "Cashfree PG",
-          status: remainingBal <= 0 ? "Full Payment Settled" : "1st Installment Settled",
-          created_at: new Date().toISOString()
-        }], { onConflict: "txn_id" });
-
-        // 2. Sync to Supabase Orders Table
-        await supabase.from("orders").update({
-          status: "PAID",
-          amount: amountPaid
-        }).eq("cashfree_order_id", orderId);
-
-        // 3. Sync to Supabase Enrollments Table
+        // 1. Fetch matched order & enrollment for exact total_amount
         const { data: matchedOrder } = await supabase
           .from("orders")
           .select("enrollment_id")
           .eq("cashfree_order_id", orderId)
           .maybeSingle();
 
+        let matchedEnrollment = null;
+        if (matchedOrder?.enrollment_id) {
+          const { data: enr } = await supabase.from("enrollments").select("*").eq("id", matchedOrder.enrollment_id).maybeSingle();
+          matchedEnrollment = enr;
+        }
+
+        const totalFee = Number(matchedEnrollment?.total_amount || cfOrderData.order_meta?.total_fee) || (amountPaid > 1500 ? amountPaid : 4000);
+        const remainingBal = Math.max(0, totalFee - amountPaid);
+        const isFullPaid = remainingBal <= 0;
+
+        // 2. Sync to Supabase Payments Table
+        await supabase.from("payments").upsert([{
+          txn_id: txnId,
+          student_name: studentName,
+          email: studentEmail,
+          mobile: studentPhone,
+          course_name: courseName,
+          payment_type: isFullPaid ? "FULL" : "INSTALLMENT",
+          amount_paid: amountPaid,
+          total_course_fee: totalFee,
+          remaining_balance: remainingBal,
+          payment_method: "Cashfree PG",
+          status: isFullPaid ? "Full Payment Settled" : `1st Installment Settled (Balance ₹${remainingBal.toLocaleString()} Due)`,
+          created_at: new Date().toISOString()
+        }], { onConflict: "txn_id" });
+
+        // 3. Sync to Supabase Orders Table
+        await supabase.from("orders").update({
+          status: "PAID",
+          amount: amountPaid
+        }).eq("cashfree_order_id", orderId);
+
+        // 4. Sync to Supabase Enrollments Table
         if (matchedOrder?.enrollment_id) {
           await supabase.from("enrollments").update({
-            payment_status: "PAID",
+            payment_status: isFullPaid ? "PAID" : "PARTIALLY_PAID",
             amount_paid: amountPaid,
             amount_pending: remainingBal,
             course_access_status: "UNLOCKED",
-            account_status: "ACTIVE"
+            account_status: "ACTIVE",
+            updated_at: new Date().toISOString()
           }).eq("id", matchedOrder.enrollment_id);
         }
       } catch (syncErr) {
