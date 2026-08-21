@@ -406,17 +406,35 @@ app.post('/api/auth/set-password', authRateLimiter, async (req, res, next) => {
     resetTokenStore.delete(resetToken);
 
     // 3. Perform Authorized Supabase Account Password Update/Creation via Targeted Lookup
+    let userId = null;
+    let authUser = null;
+
     const { data: matchedProfile } = await supabase.from('profiles').select('id, email').ilike('email', normalizedEmail).maybeSingle();
-    let userId;
 
     if (matchedProfile && matchedProfile.id) {
-      const { error: updateErr } = await supabase.auth.admin.updateUserById(matchedProfile.id, {
+      try {
+        const { data: userCheck } = await supabase.auth.admin.getUserById(matchedProfile.id);
+        if (userCheck?.user) {
+          authUser = userCheck.user;
+        }
+      } catch (e) {}
+    }
+
+    if (!authUser) {
+      try {
+        const { data: listRes } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
+        authUser = listRes?.users?.find(u => u.email?.toLowerCase() === normalizedEmail);
+      } catch (e) {}
+    }
+
+    if (authUser) {
+      const { error: updateErr } = await supabase.auth.admin.updateUserById(authUser.id, {
         password,
         email_confirm: true,
-        user_metadata: { fullName: fullName || "Student", phone: phone || "", role: "STUDENT" },
+        user_metadata: { fullName: fullName || authUser.user_metadata?.fullName || "Student", phone: phone || "", role: "STUDENT" },
       });
       if (updateErr) return res.status(400).json({ status: 'ERROR', message: updateErr.message });
-      userId = matchedProfile.id;
+      userId = authUser.id;
     } else {
       const { data: createData, error: createErr } = await supabase.auth.admin.createUser({
         email: normalizedEmail,
@@ -424,8 +442,27 @@ app.post('/api/auth/set-password', authRateLimiter, async (req, res, next) => {
         email_confirm: true,
         user_metadata: { fullName: fullName || "Student", phone: phone || "", role: "STUDENT" },
       });
-      if (createErr) return res.status(400).json({ status: 'ERROR', message: createErr.message });
-      userId = createData.user?.id;
+      if (createErr) {
+        if (createErr.message?.toLowerCase().includes("already") || createErr.status === 422 || createErr.status === 400) {
+          const { data: listRes } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
+          const existingUser = listRes?.users?.find(u => u.email?.toLowerCase() === normalizedEmail);
+          if (existingUser) {
+            const { error: updErr } = await supabase.auth.admin.updateUserById(existingUser.id, {
+              password,
+              email_confirm: true,
+              user_metadata: { fullName: fullName || existingUser.user_metadata?.fullName || "Student", phone: phone || "", role: "STUDENT" },
+            });
+            if (updErr) return res.status(400).json({ status: 'ERROR', message: updErr.message });
+            userId = existingUser.id;
+          } else {
+            return res.status(400).json({ status: 'ERROR', message: createErr.message });
+          }
+        } else {
+          return res.status(400).json({ status: 'ERROR', message: createErr.message });
+        }
+      } else {
+        userId = createData.user?.id;
+      }
     }
 
     if (userId) {
