@@ -190,7 +190,7 @@ function getWelcomeEmailTemplate({ fullName = "Student", email = "" }) {
                 <tr>
                   <td style="padding: 20px 24px;">
                     <p style="margin: 0 0 14px 0; font-size: 13.5px; color: #334155; line-height: 1.6;">
-                      <strong>Student LMS Portal URL:</strong> <a href="${SITE_URL}/login" style="color: ${BRAND_NAVY}; font-weight: 800; text-decoration: underline;">${SITE_URL}/login</a><br>
+                      <strong>Student NLS Portal URL:</strong> <a href="${SITE_URL}/login" style="color: ${BRAND_NAVY}; font-weight: 800; text-decoration: underline;">${SITE_URL}/login</a><br>
                       <strong>Your Registered Email:</strong> <span style="color: ${BRAND_ORANGE}; font-weight: 800;">${email || "Your Registered Email"}</span>
                     </p>
 
@@ -210,7 +210,7 @@ function getWelcomeEmailTemplate({ fullName = "Student", email = "" }) {
                       <tr>
                         <td style="vertical-align: top; width: 24px; font-weight: 800; color: #047857;">3.</td>
                         <td style="line-height: 1.5;">
-                          <strong>NLS Student LMS Dashboard:</strong> Once logged in, your dashboard will display your enrolled course schedules, live Zoom class links, assignments, and certificates.
+                          <strong>InternNetra NLS Dashboard:</strong> Once logged in, your dashboard will display your enrolled course schedules, live Zoom class links, assignments, and certificates.
                         </td>
                       </tr>
                     </table>
@@ -237,7 +237,7 @@ function getWelcomeEmailTemplate({ fullName = "Student", email = "" }) {
                 </tr>
                 <tr>
                   <td style="padding-bottom: 12px; font-size: 14px; color: #334155; line-height: 1.5;">
-                    🔹 <strong>NLS LMS Dashboard:</strong> Access session recordings, code repositories, and project submission hubs.
+                    🔹 <strong>InternNetra NLS Dashboard:</strong> Access session recordings, code repositories, and project submission hubs.
                   </td>
                 </tr>
                 <tr>
@@ -358,7 +358,7 @@ function getPaymentReceiptTemplate({
                 <tr>
                   <td style="background-color: ${BRAND_NAVY}; padding: 14px 20px;">
                     <span style="color: #ffffff; font-size: 14px; font-weight: 800; font-family: 'Segoe UI', Arial, sans-serif; letter-spacing: 0.5px;">
-                      🔑 HOW TO ACCESS YOUR STUDENT LMS PORTAL
+                      🔑 HOW TO ACCESS YOUR STUDENT NLS PORTAL
                     </span>
                   </td>
                 </tr>

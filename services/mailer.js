@@ -4,7 +4,7 @@
  */
 
 const nodemailer = require("nodemailer");
-const { getOtpEmailTemplate, getWelcomeEmailTemplate, getPaymentReceiptTemplate } = require("./emailTemplates");
+const { getOtpEmailTemplate, getWelcomeEmailTemplate, getPaymentReceiptTemplate } = require("../templates/emailTemplates");
 
 // Create Reusable SMTP Transporter with Environment Credentials
 function createTransporter() {
