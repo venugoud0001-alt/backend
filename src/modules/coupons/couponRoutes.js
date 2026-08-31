@@ -33,6 +33,11 @@ router.get('/code/:code', (req, res, next) => {
   couponController.getCouponByCode(req, res, next);
 });
 
+// 2b. PUBLIC: Get visible active coupons for main site display
+router.get(['/public', '/coupons/public'], (req, res, next) => {
+  couponController.getPublicCoupons(req, res, next);
+});
+
 // 3. ADMIN: Get All Coupons Catalog
 router.get('/', authenticateJWT, requirePermission('coupon.view'), (req, res, next) => {
   couponController.getCoupons(req, res, next);

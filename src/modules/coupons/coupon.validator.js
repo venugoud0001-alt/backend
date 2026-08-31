@@ -100,7 +100,10 @@ function validateCreateCoupon(req) {
       maximum_discount_amount: maximum_discount_amount !== undefined && maximum_discount_amount !== null && maximum_discount_amount !== '' ? Math.max(0, Number(maximum_discount_amount)) : null,
       applicability: app,
       course_id: course_id || null,
-      department_id: department_id || null
+      department_id: department_id || null,
+      is_visible_on_site: req.body.is_visible_on_site !== undefined 
+        ? Boolean(req.body.is_visible_on_site) 
+        : (req.body.show_on_site !== undefined ? Boolean(req.body.show_on_site) : true)
     }
   };
 }
@@ -117,6 +120,12 @@ function validateUpdateCoupon(req) {
   }
 
   const sanitizedData = {};
+
+  if (body.is_visible_on_site !== undefined) {
+    sanitizedData.is_visible_on_site = Boolean(body.is_visible_on_site);
+  } else if (body.show_on_site !== undefined) {
+    sanitizedData.is_visible_on_site = Boolean(body.show_on_site);
+  }
 
   if (body.code !== undefined) {
     if (typeof body.code !== 'string' || body.code.trim().length === 0) {

@@ -17,7 +17,8 @@ const inMemoryCoupons = new Map([
     starts_at: new Date('2025-01-01').toISOString(),
     expires_at: null,
     usage_limit: null,
-    used_count: 0
+    used_count: 0,
+    is_visible_on_site: true
   }],
   ['EARLY2026', {
     id: 'c-early2026',
@@ -31,7 +32,8 @@ const inMemoryCoupons = new Map([
     starts_at: new Date('2025-01-01').toISOString(),
     expires_at: null,
     usage_limit: null,
-    used_count: 0
+    used_count: 0,
+    is_visible_on_site: true
   }],
   ['16/08/26-INLS', {
     id: 'c-inls1000',
@@ -45,7 +47,8 @@ const inMemoryCoupons = new Map([
     starts_at: new Date('2025-01-01').toISOString(),
     expires_at: null,
     usage_limit: null,
-    used_count: 0
+    used_count: 0,
+    is_visible_on_site: true
   }]
 ]);
 
@@ -63,7 +66,8 @@ class CouponService {
       minimum_course_amount: Number(data.minimum_course_amount || 0),
       usage_limit: data.usage_limit ? Number(data.usage_limit) : null,
       starts_at: data.starts_at || null,
-      expires_at: data.expires_at || null
+      expires_at: data.expires_at || null,
+      is_visible_on_site: data.is_visible_on_site !== undefined ? Boolean(data.is_visible_on_site) : true
     };
 
     const rawDesc = String(data.description || '');
@@ -634,6 +638,10 @@ class CouponService {
       ? Number(c.minimum_course_amount)
       : Number(meta?.minimum_course_amount || 0);
 
+    const isVisibleOnSite = c.is_visible_on_site !== undefined
+      ? Boolean(c.is_visible_on_site)
+      : (meta?.is_visible_on_site !== undefined ? Boolean(meta.is_visible_on_site) : true);
+
     return {
       id: c.id,
       code: String(c.code).trim().toUpperCase(),
@@ -653,9 +661,59 @@ class CouponService {
       applicability,
       course_id: courseId,
       department_id: departmentId,
+      is_visible_on_site: isVisibleOnSite,
+      show_on_site: isVisibleOnSite,
       created_at: c.created_at || new Date().toISOString(),
       updated_at: c.updated_at || new Date().toISOString()
     };
+  }
+
+  /**
+   * Public API: Get all active coupons visible on the main site
+   * Optional courseId to filter for global + course-applicable coupons
+   */
+  async getPublicCoupons(courseId = null) {
+    const allCoupons = await this.getAllCoupons();
+    const cleanCourseId = courseId ? String(courseId).trim().toLowerCase() : null;
+
+    let targetCourse = null;
+    if (cleanCourseId) {
+      targetCourse = await courseService.getCourseByIdentifier(cleanCourseId, false).catch(() => null);
+    }
+
+    return allCoupons.filter(c => {
+      // Must be ACTIVE
+      if (c.status !== 'ACTIVE') return false;
+      // Must be marked visible on site
+      if (c.is_visible_on_site === false) return false;
+
+      // If course is specified, filter by applicability
+      if (targetCourse) {
+        const app = (c.applicability || 'GLOBAL').toUpperCase();
+        if (app === 'GLOBAL') return true;
+        if (app === 'COURSE') {
+          const allowed = Array.isArray(c.course_id) ? c.course_id : [c.course_id];
+          return allowed.some(cId => {
+            if (!cId) return false;
+            const str = String(cId).trim().toLowerCase();
+            return str === String(targetCourse.id).toLowerCase() || str === String(targetCourse.slug).toLowerCase();
+          });
+        }
+        if (app === 'DEPARTMENT') {
+          const allowed = Array.isArray(c.department_id) ? c.department_id : [c.department_id];
+          const deptId = targetCourse.department_id || targetCourse.category_id;
+          const deptSlug = targetCourse.department_slug;
+          return allowed.some(dId => {
+            if (!dId) return false;
+            const str = String(dId).trim().toLowerCase();
+            return str === String(deptId).toLowerCase() || str === String(deptSlug).toLowerCase();
+          });
+        }
+        return false;
+      }
+
+      return true;
+    });
   }
 }
 

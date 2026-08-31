@@ -22,6 +22,20 @@ class CouponController {
   }
 
   /**
+   * Public API: Get visible active coupons for main site display
+   * GET /api/coupons/public
+   */
+  async getPublicCoupons(req, res, next) {
+    try {
+      const courseId = req.query.courseId || req.query.course_id || null;
+      const coupons = await couponService.getPublicCoupons(courseId);
+      return successResponse(res, { coupons });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
    * Admin API: Get all coupons
    * GET /api/coupons
    */
