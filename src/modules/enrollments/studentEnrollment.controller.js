@@ -1,4 +1,5 @@
-const { supabase } = require('../../../config/supabase');
+const { supabase } = require('../../config/supabase');
+const { addCalendarMonths, isAccessExpired } = require('../../utils/dateUtils');
 
 /**
  * Authoritative Student Enrollments Controller
@@ -36,7 +37,7 @@ async function getStudentEnrollments(req, res) {
 
     // 3. If student record exists, fetch enrollments joined with courses
     if (student?.id) {
-      const { data: enrData, error: eErr } = await supabase
+      let { data: enrData, error: eErr } = await supabase
         .from('enrollments')
         .select(`
           id,
@@ -55,6 +56,8 @@ async function getStudentEnrollments(req, res) {
           certificate_status,
           certificate_id,
           batch_name,
+          access_start_date,
+          access_expiry_date,
           created_at,
           updated_at
         `)
@@ -62,8 +65,38 @@ async function getStudentEnrollments(req, res) {
         .order('created_at', { ascending: false });
 
       if (eErr) {
-        console.warn('[ENROLLMENT_API] Enrollments query note:', eErr.message);
-      } else if (Array.isArray(enrData) && enrData.length > 0) {
+        // Fallback to base columns if access columns not yet migrated
+        const { data: fallbackData } = await supabase
+          .from('enrollments')
+          .select(`
+            id,
+            student_id,
+            course_id,
+            course_name,
+            total_amount,
+            amount_paid,
+            amount_pending,
+            payment_plan,
+            payment_status,
+            course_access_status,
+            account_status,
+            progress,
+            completed_lessons,
+            certificate_status,
+            certificate_id,
+            batch_name,
+            created_at,
+            updated_at
+          `)
+          .eq('student_id', student.id)
+          .order('created_at', { ascending: false });
+
+        if (Array.isArray(fallbackData) && fallbackData.length > 0) {
+          enrData = fallbackData;
+        }
+      }
+
+      if (Array.isArray(enrData) && enrData.length > 0) {
         enrollments = enrData;
       }
     }
@@ -187,6 +220,10 @@ async function getStudentEnrollments(req, res) {
           : Math.max(0, totalAmt - paidAmt)
       );
 
+      const accessStart = enr.access_start_date || enr.created_at || new Date().toISOString();
+      const accessExpiry = enr.access_expiry_date || addCalendarMonths(accessStart, 6).toISOString();
+      const isExpired = isAccessExpired(accessExpiry);
+
       return {
         id: course?.id || enr.course_id || enr.id,
         enrollmentId: enr.id,
@@ -211,7 +248,12 @@ async function getStudentEnrollments(req, res) {
         progress: progressPercent,
         curriculum: modules,
         enrolledAt: enr.created_at || new Date().toISOString(),
-        status: enr.course_access_status === 'LOCKED' ? 'Pending Payment' : 'Active',
+        accessStartDate: accessStart,
+        accessExpiryDate: accessExpiry,
+        access_start_date: accessStart,
+        access_expiry_date: accessExpiry,
+        isExpired: isExpired,
+        status: isExpired ? 'Access Expired' : (enr.course_access_status === 'LOCKED' ? 'Pending Payment' : 'Active'),
         source: 'Authoritative Backend Database'
       };
     });

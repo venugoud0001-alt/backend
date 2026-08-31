@@ -7,6 +7,7 @@ const { supabase } = require('../../config/supabase');
 const s3VideoService = require('./video.s3.service');
 const mediaConvertVideoService = require('./video.mediaconvert.service');
 const { VIDEO_STATUS, ALLOWED_VIDEO_MIME_TYPES, MAX_VIDEO_FILE_SIZE_BYTES } = require('./video.constants');
+const { addCalendarMonths, isAccessExpired } = require('../../utils/dateUtils');
 const cloudFrontVideoService = require('./video.cloudfront.service');
 const env = require('../../config/env');
 
@@ -412,10 +413,10 @@ class VideoService {
       }
       studentId = student.id;
 
-      // Verify Active Enrollment
+      // Verify Active Enrollment & 6-Month Course Access Expiry
       const { data: enrollment } = await supabase
         .from('enrollments')
-        .select('id, student_id, course_id, payment_status, course_access_status')
+        .select('id, student_id, course_id, payment_status, course_access_status, access_start_date, access_expiry_date, created_at')
         .eq('student_id', student.id)
         .eq('course_id', course.id)
         .maybeSingle();
@@ -430,6 +431,20 @@ class VideoService {
 
       if (!hasActiveAccess) {
         throw { statusCode: 403, message: 'Course access locked: Successful payment or enrollment activation required.' };
+      }
+
+      // Authoritative 6-Month Access Expiry Check
+      let effectiveExpiry = enrollment.access_expiry_date;
+      if (!effectiveExpiry && enrollment.created_at) {
+        effectiveExpiry = addCalendarMonths(enrollment.created_at, 6);
+      }
+
+      if (effectiveExpiry && isAccessExpired(effectiveExpiry)) {
+        throw {
+          statusCode: 403,
+          code: 'COURSE_ACCESS_EXPIRED',
+          message: `Course access expired on ${new Date(effectiveExpiry).toLocaleDateString('en-GB')}. 6-month access limit reached. Please repurchase or renew to continue.`
+        };
       }
 
       enrollmentId = enrollment.id;

@@ -14,6 +14,7 @@ const couponService = require('../src/modules/coupons/coupon.service');
 const pricingService = require('../src/modules/pricing/pricing.service');
 const { calculateDiscountedPricing } = require('../src/utils/pricingEngine');
 const { getStudentEnrollments } = require('../src/modules/enrollments/studentEnrollment.controller');
+const { addCalendarMonths } = require('../src/utils/dateUtils');
 
 // Authoritative Student Enrollments Endpoint
 router.get(['/student/enrollments', '/enrollments/my-enrollments'], getStudentEnrollments);
@@ -503,13 +504,18 @@ router.post(['/payments/verify-order', '/payments/verify'], async (req, res, nex
         }).eq("cashfree_order_id", orderId);
 
         if (matchedOrder?.enrollment_id) {
+          const nowIso = new Date().toISOString();
+          const expiryIso = addCalendarMonths(nowIso, 6).toISOString();
+
           await supabase.from("enrollments").update({
             payment_status: isFullPaid ? "PAID" : "PARTIALLY_PAID",
             amount_paid: amountPaid,
             amount_pending: remainingBal,
             course_access_status: "UNLOCKED",
             account_status: "ACTIVE",
-            updated_at: new Date().toISOString()
+            access_start_date: nowIso,
+            access_expiry_date: expiryIso,
+            updated_at: nowIso
           }).eq("id", matchedOrder.enrollment_id);
         }
       } catch (syncErr) {
@@ -890,11 +896,16 @@ router.post('/webhooks/cashfree', async (req, res) => {
         status: 'SUCCESS'
       }]);
 
+      const accessStartTime = new Date().toISOString();
+      const accessExpiryTime = addCalendarMonths(accessStartTime, 6).toISOString();
+
       await supabase.from('enrollments').update({
         amount_paid: newAmountPaid,
         amount_pending: newAmountPending,
         payment_status: newPaymentStatus,
         course_access_status: isFullPayment ? 'ACTIVE' : 'PARTIAL',
+        access_start_date: accessStartTime,
+        access_expiry_date: accessExpiryTime,
         updated_at: new Date().toISOString()
       }).eq('id', enrollment.id).neq('payment_status', 'PAID');
 
