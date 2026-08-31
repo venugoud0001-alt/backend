@@ -52,4 +52,10 @@ router.post(
   videoController.handleWebhook
 );
 
+// 7. Secure HLS Video Streaming Proxy (Direct zero-403 streaming)
+router.get(
+  '/video/hls-stream/*',
+  videoController.streamHlsFile
+);
+
 module.exports = router;

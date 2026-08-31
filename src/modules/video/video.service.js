@@ -581,10 +581,18 @@ class VideoService {
       expiresInSeconds: 14400 // 4 Hours
     });
 
-    const signedStreamUrl = cloudFrontVideoService.generateSignedPlaybackUrl({
+    let signedStreamUrl = cloudFrontVideoService.generateSignedPlaybackUrl({
       hlsMasterUrl: masterUrl,
       expiresInSeconds: 14400
     });
+
+    if (signedStreamUrl && (signedStreamUrl.includes('s3.amazonaws.com') || signedStreamUrl.includes('.s3.'))) {
+      try {
+        const parsed = new URL(signedStreamUrl);
+        const s3Key = parsed.pathname.replace(/^\/+/, '');
+        signedStreamUrl = `/api/video/hls-stream/${s3Key}`;
+      } catch (e) {}
+    }
 
     return {
       status: 'AUTHORIZED',
