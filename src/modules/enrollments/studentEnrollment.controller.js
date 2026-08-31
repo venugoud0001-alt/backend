@@ -224,6 +224,9 @@ async function getStudentEnrollments(req, res) {
       const accessExpiry = enr.access_expiry_date || addCalendarMonths(accessStart, 6).toISOString();
       const isExpired = isAccessExpired(accessExpiry);
 
+      const rawThumb = course?.image_url || '';
+      const cleanThumb = typeof rawThumb === 'string' && !rawThumb.includes('[object Object]') && rawThumb !== 'null' && rawThumb !== 'undefined' ? rawThumb.trim() : '';
+
       return {
         id: course?.id || enr.course_id || enr.id,
         enrollmentId: enr.id,
@@ -233,16 +236,23 @@ async function getStudentEnrollments(req, res) {
         title: canonicalTitle,
         slug: canonicalSlug,
         rawName: enr.course_name,
-        thumbnail_url: course?.image_url || '',
-        image_url: course?.image_url || '',
+        thumbnail_url: cleanThumb,
+        image_url: cleanThumb,
         totalAmount: totalAmt,
+        total_amount: totalAmt,
         totalFee: totalAmt,
         amountPaid: paidAmt,
+        amount_paid: paidAmt,
         amountPending: pendingAmt,
+        amount_pending: pendingAmt,
         remainingBalance: pendingAmt,
+        remaining_balance: pendingAmt,
         paymentPlan: enr.payment_plan || (pendingAmt > 0 ? 'INSTALLMENT' : 'FULL'),
+        payment_plan: enr.payment_plan || (pendingAmt > 0 ? 'INSTALLMENT' : 'FULL'),
         paymentStatus: enr.payment_status || (pendingAmt <= 0 ? 'PAID' : (paidAmt > 0 ? 'PARTIALLY_PAID' : 'PAYMENT_PENDING')),
+        payment_status: enr.payment_status || (pendingAmt <= 0 ? 'PAID' : (paidAmt > 0 ? 'PARTIALLY_PAID' : 'PAYMENT_PENDING')),
         courseAccessStatus: enr.course_access_status || (paidAmt > 0 ? 'UNLOCKED' : 'LOCKED'),
+        course_access_status: enr.course_access_status || (paidAmt > 0 ? 'UNLOCKED' : 'LOCKED'),
         completedLessons: completed,
         totalLessons: totalLessons,
         progress: progressPercent,

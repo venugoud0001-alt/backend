@@ -457,31 +457,63 @@ router.post(['/payments/verify-order', '/payments/verify'], async (req, res, nex
 
     const isPaid = cfOrderData.order_status === "PAID";
 
+    let matchedOrder = null;
+    let matchedEnrollment = null;
+    let amountPaid = Number(cfOrderData.order_amount) || 0;
+    let totalFee = 0;
+    let remainingBal = 0;
+    let isFullPaid = false;
+
+    try {
+      const { data: ord } = await supabase
+        .from("orders")
+        .select("enrollment_id, installment_number, amount")
+        .or(`cashfree_order_id.eq.${orderId},order_id.eq.${orderId}`)
+        .maybeSingle();
+
+      matchedOrder = ord;
+      if (matchedOrder?.enrollment_id) {
+        const { data: enr } = await supabase.from("enrollments").select("*").eq("id", matchedOrder.enrollment_id).maybeSingle();
+        matchedEnrollment = enr;
+      }
+    } catch (lookupErr) {
+      console.warn("Order lookup note:", lookupErr.message);
+    }
+
+    if (matchedEnrollment) {
+      totalFee = Number(matchedEnrollment.total_amount) || totalFee;
+      remainingBal = matchedEnrollment.amount_pending !== undefined ? Number(matchedEnrollment.amount_pending) : Math.max(0, totalFee - amountPaid);
+      isFullPaid = matchedEnrollment.payment_status === "PAID" || (remainingBal <= 0 && matchedEnrollment.payment_plan !== "INSTALLMENT");
+    } else {
+      totalFee = Number(cfOrderData.order_meta?.total_fee) || (amountPaid > 1500 ? amountPaid : 4000);
+      remainingBal = Math.max(0, totalFee - amountPaid);
+      isFullPaid = remainingBal <= 0;
+    }
+
     if (isPaid) {
       try {
         const customer = cfOrderData.customer_details || {};
         const studentEmail = (customer.customer_email || "").toLowerCase().trim();
         const studentName = customer.customer_name || "Enrolled Student";
         const studentPhone = customer.customer_phone || "";
-        const amountPaid = Number(cfOrderData.order_amount) || 0;
-        const courseName = (cfOrderData.order_note || "").replace("Enrollment - ", "").replace("Registration Token - ", "") || "Live Program";
+        const courseName = (cfOrderData.order_note || "").replace("Enrollment - ", "").replace("Registration Token - ", "") || matchedEnrollment?.course_name || "Live Program";
         const txnId = cfOrderData.cf_order_id ? String(cfOrderData.cf_order_id) : `CF_${orderId}`;
 
-        const { data: matchedOrder } = await supabase
-          .from("orders")
-          .select("enrollment_id")
-          .eq("cashfree_order_id", orderId)
-          .maybeSingle();
-
-        let matchedEnrollment = null;
-        if (matchedOrder?.enrollment_id) {
-          const { data: enr } = await supabase.from("enrollments").select("*").eq("id", matchedOrder.enrollment_id).maybeSingle();
-          matchedEnrollment = enr;
+        if (matchedOrder?.installment_number > 1 && matchedEnrollment) {
+          const prevPaid = Number(matchedEnrollment.amount_paid) || 0;
+          const cumPaid = prevPaid + amountPaid;
+          remainingBal = Math.max(0, totalFee - cumPaid);
+          isFullPaid = remainingBal <= 0;
+          matchedEnrollment.amount_paid = cumPaid;
+          matchedEnrollment.amount_pending = remainingBal;
+          matchedEnrollment.payment_status = isFullPaid ? "PAID" : "PARTIALLY_PAID";
+        } else if (matchedEnrollment) {
+          remainingBal = Math.max(0, totalFee - amountPaid);
+          isFullPaid = remainingBal <= 0;
+          matchedEnrollment.amount_paid = amountPaid;
+          matchedEnrollment.amount_pending = remainingBal;
+          matchedEnrollment.payment_status = isFullPaid ? "PAID" : "PARTIALLY_PAID";
         }
-
-        const totalFee = Number(matchedEnrollment?.total_amount || cfOrderData.order_meta?.total_fee) || (amountPaid > 1500 ? amountPaid : 4000);
-        const remainingBal = Math.max(0, totalFee - amountPaid);
-        const isFullPaid = remainingBal <= 0;
 
         await supabase.from("payments").upsert([{
           txn_id: txnId,
@@ -509,7 +541,7 @@ router.post(['/payments/verify-order', '/payments/verify'], async (req, res, nex
 
           await supabase.from("enrollments").update({
             payment_status: isFullPaid ? "PAID" : "PARTIALLY_PAID",
-            amount_paid: amountPaid,
+            amount_paid: matchedEnrollment.amount_paid,
             amount_pending: remainingBal,
             course_access_status: "UNLOCKED",
             account_status: "ACTIVE",
@@ -527,7 +559,24 @@ router.post(['/payments/verify-order', '/payments/verify'], async (req, res, nex
       status: 'SUCCESS',
       isPaid,
       orderStatus: cfOrderData.order_status,
-      data: cfOrderData
+      data: {
+        ...cfOrderData,
+        order_meta: {
+          ...(cfOrderData.order_meta || {}),
+          total_fee: totalFee,
+          remaining_balance: remainingBal,
+          payment_plan: matchedEnrollment?.payment_plan || (isFullPaid ? "FULL" : "INSTALLMENT"),
+        },
+      },
+      enrollment: matchedEnrollment ? {
+        id: matchedEnrollment.id,
+        course_name: matchedEnrollment.course_name,
+        total_amount: totalFee,
+        amount_paid: matchedEnrollment.amount_paid || amountPaid,
+        amount_pending: remainingBal,
+        payment_plan: matchedEnrollment.payment_plan || (isFullPaid ? "FULL" : "INSTALLMENT"),
+        payment_status: matchedEnrollment.payment_status || (isFullPaid ? "PAID" : "PARTIALLY_PAID"),
+      } : null,
     });
   } catch (err) {
     next(err);
