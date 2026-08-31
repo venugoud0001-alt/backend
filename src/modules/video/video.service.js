@@ -243,6 +243,19 @@ class VideoService {
       if (course && Array.isArray(course.curriculum_modules)) {
         let modified = false;
         const updatedModules = course.curriculum_modules.map(mod => {
+          const matchesMod = (record.module_id && String(mod.id) === String(record.module_id)) ||
+                            (record.lesson_id && (String(mod.id) === String(record.lesson_id) || String(mod.video_asset_id) === String(record.id)));
+
+          if (matchesMod) {
+            modified = true;
+            return {
+              ...mod,
+              video_url: record.hls_master_url,
+              video_status: VIDEO_STATUS.READY,
+              video_asset_id: record.id
+            };
+          }
+
           if (Array.isArray(mod.lessons)) {
             const updatedLessons = mod.lessons.map(l => {
               if (String(l.id) === String(record.lesson_id)) {
@@ -255,7 +268,12 @@ class VideoService {
               }
               return l;
             });
-            return { ...mod, lessons: updatedLessons };
+            return {
+              ...mod,
+              video_url: mod.video_url || record.hls_master_url,
+              video_status: mod.video_status || VIDEO_STATUS.READY,
+              lessons: updatedLessons
+            };
           }
           return mod;
         });
