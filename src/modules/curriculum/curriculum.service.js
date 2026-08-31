@@ -355,12 +355,21 @@ class CurriculumService {
       const indexStr = String(mIdx + 1);
 
       // 1. Explicit ID Matching (Exact UUID or string ID)
-      if (m.id && String(m.id).trim().toLowerCase() === cleanTarget) return true;
-      if (m.id && `mod_${m.id}`.toLowerCase() === cleanTarget) return true;
-      if (mId && mId === cleanTarget) return true;
+      if (m.id && String(m.id).trim().toLowerCase() === cleanTarget) {
+        if (/^[0-9]+$/.test(cleanTarget) && !courseId) return false;
+        return true;
+      }
+      if (m.id && `mod_${m.id}`.toLowerCase() === cleanTarget) {
+        if (!courseId) return false;
+        return true;
+      }
+      if (mId && mId === cleanTarget) {
+        if (/^[0-9]+$/.test(cleanTarget) && !courseId) return false;
+        return true;
+      }
 
       // 2. Fallback matching ONLY IF m.id is missing or undefined
-      if (!m.id) {
+      if (!m.id && courseId) {
         if (fallbackId === cleanTarget) return true;
         if (indexStr === cleanTarget) return true;
         if (mTitle && mTitle === cleanTarget) return true;
