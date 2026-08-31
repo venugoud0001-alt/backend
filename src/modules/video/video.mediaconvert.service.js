@@ -28,7 +28,8 @@ class MediaConvertVideoService {
    * Generates MediaConvert job parameters for 720p & 1080p HLS output
    */
   buildJobSettings({ sourceBucket, sourceKey, outputPrefix }) {
-    const destination = `s3://${this.outputBucket}/${outputPrefix}`;
+    const baseDest = `s3://${this.outputBucket}/${outputPrefix}`;
+    const destination = baseDest.endsWith('/') ? `${baseDest}master` : `${baseDest}/master`;
 
     return {
       TimecodeConfig: { Source: 'ZEROBASED' },

@@ -28,16 +28,25 @@ class S3VideoService {
 
   /**
    * Generates a pre-signed URL for direct browser-to-S3 upload
+   * Supports human-readable slug keys or legacy ID paths
    */
-  async generatePresignedUploadUrl({ courseId, moduleId, lessonId, fileName, contentType }) {
-    const ext = fileName.split('.').pop() || 'mp4';
-    const cleanFileName = `source_${Date.now()}.${ext}`;
-    const s3Key = `courses/${courseId}/modules/${moduleId}/lessons/${lessonId}/${cleanFileName}`;
+  async generatePresignedUploadUrl({ s3Key, courseSlug, moduleSlug, courseId, moduleId, lessonId, fileName, contentType }) {
+    let finalKey = s3Key;
+    if (!finalKey) {
+      if (courseSlug && moduleSlug) {
+        const { buildS3SourceKey } = require('../../utils/s3PathUtils');
+        finalKey = buildS3SourceKey(courseSlug, moduleSlug, fileName || 'video.mp4');
+      } else {
+        const ext = (fileName || 'video.mp4').split('.').pop() || 'mp4';
+        const cleanFileName = `source_${Date.now()}.${ext}`;
+        finalKey = `courses/${courseId || 'general'}/modules/${moduleId || 'general'}/lessons/${lessonId || '1'}/${cleanFileName}`;
+      }
+    }
 
     const command = new PutObjectCommand({
       Bucket: this.sourceBucket,
-      Key: s3Key,
-      ContentType: contentType
+      Key: finalKey,
+      ContentType: contentType || 'video/mp4'
     });
 
     // 60-minute expiration for direct upload
@@ -45,7 +54,7 @@ class S3VideoService {
     return {
       uploadUrl,
       s3Bucket: this.sourceBucket,
-      s3Key,
+      s3Key: finalKey,
       expiresInSeconds: 3600
     };
   }

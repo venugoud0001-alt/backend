@@ -31,19 +31,48 @@ class VideoService {
     memoryVideoStore.set(String(finalId), fullRecord);
 
     try {
+      // Find existing record by lesson_id or id to reuse primary key
+      const { data: existing } = await supabase
+        .from('lesson_videos')
+        .select('id')
+        .or(`id.eq.${finalId},lesson_id.eq.${String(payload.lesson_id)}`)
+        .maybeSingle();
+
+      const recordId = existing?.id || finalId;
+      fullRecord.id = recordId;
+
+      const ALLOWED_DB_COLS = [
+        'id', 'lesson_id', 'course_id', 'module_id', 'title', 'status',
+        'source_s3_bucket', 'source_s3_key', 'source_deleted_at',
+        'mediaconvert_job_id', 'hls_master_url', 'hls_720p_url', 'hls_1080p_url',
+        'duration_seconds', 'file_size_bytes', 'thumbnail_url',
+        'error_code', 'error_message', 'is_published',
+        'upload_started_at', 'upload_completed_at',
+        'processing_started_at', 'processing_completed_at',
+        'created_at', 'updated_at'
+      ];
+
+      const cleanPayload = {};
+      for (const col of ALLOWED_DB_COLS) {
+        if (fullRecord[col] !== undefined) {
+          cleanPayload[col] = fullRecord[col];
+        }
+      }
+
       const { data, error } = await supabase
         .from('lesson_videos')
-        .upsert(payload, { onConflict: 'lesson_id' })
+        .upsert(cleanPayload, { onConflict: 'id' })
         .select()
         .single();
 
       if (!error && data) {
-        memoryVideoStore.set(String(data.lesson_id), data);
-        memoryVideoStore.set(String(data.id), data);
-        return data;
+        const merged = { ...fullRecord, ...data };
+        memoryVideoStore.set(String(data.lesson_id), merged);
+        memoryVideoStore.set(String(data.id), merged);
+        return merged;
       }
     } catch (err) {
-      // Fall through to in-memory fallback if table isn't migrated yet
+      console.warn('⚠️ [Video Pipeline] Notice persisting to lesson_videos:', err.message);
     }
 
     return fullRecord;
@@ -60,7 +89,7 @@ class VideoService {
       const { data, error } = await supabase
         .from('lesson_videos')
         .select('*')
-        .or(`id.eq.${strId},lesson_id.eq.${strId}`)
+        .or(`id.eq.${strId},lesson_id.eq.${strId},module_id.eq.${strId}`)
         .maybeSingle();
 
       if (!error && data) {
@@ -76,6 +105,8 @@ class VideoService {
    * 1. Admin Requests Video Upload: Validates file, creates presigned S3 URL, records UPLOADING state
    */
   async requestUpload(adminUser, { courseId, moduleId, lessonId, fileName, contentType, fileSizeBytes, title }) {
+    const s3PathUtils = require('../../utils/s3PathUtils');
+
     if (!courseId || !lessonId) {
       throw { statusCode: 400, message: 'courseId and lessonId are required.' };
     }
@@ -102,21 +133,46 @@ class VideoService {
     }
 
     // Validate Course Exists
-    const { data: course, error: courseErr } = await supabase
-      .from('courses')
-      .select('id, title, curriculum_modules')
-      .or(`id.eq.${courseId},slug.eq.${courseId}`)
-      .maybeSingle();
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(courseId));
+    let courseQuery = supabase.from('courses').select('id, title, slug, curriculum_modules');
+    if (isUUID) {
+      courseQuery = courseQuery.or(`id.eq.${courseId},slug.eq.${courseId}`);
+    } else {
+      courseQuery = courseQuery.eq('slug', courseId);
+    }
+    const { data: course, error: courseErr } = await courseQuery.maybeSingle();
 
     if (courseErr || !course) {
       throw { statusCode: 404, message: `Course '${courseId}' not found.` };
     }
 
-    // Generate Direct-to-S3 Presigned URL
+    // Determine Human-Readable S3 Slugs
+    const courseSlug = s3PathUtils.generateS3CourseSlug(course);
+    let targetMod = null;
+    let modIdx = 0;
+
+    if (Array.isArray(course.curriculum_modules)) {
+      const foundIdx = course.curriculum_modules.findIndex(m => 
+        String(m.id) === String(moduleId) || 
+        String(m.id) === String(lessonId) ||
+        (Array.isArray(m.lessons) && m.lessons.some(l => String(l.id) === String(lessonId)))
+      );
+      if (foundIdx !== -1) {
+        modIdx = foundIdx;
+        targetMod = course.curriculum_modules[foundIdx];
+      }
+    }
+
+    const moduleSlug = s3PathUtils.generateS3ModuleSlug(targetMod || moduleId || `Module ${modIdx + 1}`, modIdx + 1);
+    const cleanFileName = s3PathUtils.sanitizeS3FileName(fileName, title || 'video');
+    const s3Key = s3PathUtils.buildS3SourceKey(courseSlug, moduleSlug, cleanFileName);
+    const hlsPrefix = s3PathUtils.buildS3HlsPrefix(courseSlug, moduleSlug);
+
+    // Generate Direct-to-S3 Presigned URL using clean S3 key
     const presignedData = await s3VideoService.generatePresignedUploadUrl({
-      courseId,
-      moduleId: moduleId || 'general',
-      lessonId,
+      s3Key,
+      courseSlug,
+      moduleSlug,
       fileName,
       contentType
     });
@@ -127,8 +183,11 @@ class VideoService {
     const recordPayload = {
       id: videoAssetId,
       lesson_id: String(lessonId),
-      course_id: courseId,
-      module_id: String(moduleId || 'general'),
+      course_id: course.id,
+      module_id: String(moduleId || targetMod?.id || 'general'),
+      course_slug: courseSlug,
+      module_slug: moduleSlug,
+      hls_prefix: hlsPrefix,
       title: title || fileName,
       status: VIDEO_STATUS.UPLOADING,
       source_s3_bucket: presignedData.s3Bucket,
@@ -155,6 +214,7 @@ class VideoService {
    * 2. Confirm Direct Upload & Start MediaConvert Processing
    */
   async confirmUploadAndStartProcessing(adminUser, { videoAssetId, lessonId }) {
+    const s3PathUtils = require('../../utils/s3PathUtils');
     const record = await this.getVideoRecord(videoAssetId || lessonId);
     if (!record) {
       throw { statusCode: 404, message: 'Video upload record not found.' };
@@ -166,7 +226,11 @@ class VideoService {
       throw { statusCode: 400, message: 'Source file not found in S3 ingest bucket. Upload may have been aborted.' };
     }
 
-    const outputPrefix = `courses/${record.course_id}/modules/${record.module_id}/lessons/${record.lesson_id}/`;
+    // Output prefix: use human-readable slug prefix if available, fallback to legacy path
+    const outputPrefix = record.hls_prefix || 
+      (record.course_slug && record.module_slug 
+        ? s3PathUtils.buildS3HlsPrefix(record.course_slug, record.module_slug)
+        : `courses/${record.course_id}/modules/${record.module_id}/lessons/${record.lesson_id}/`);
 
     // Start AWS MediaConvert Job
     const jobResult = await mediaConvertVideoService.submitTranscodeJob({
@@ -193,6 +257,7 @@ class VideoService {
       hls_master_url: masterPlaylistUrl,
       hls_720p_url: hls720pUrl,
       hls_1080p_url: hls1080pUrl,
+      hls_prefix: outputPrefix,
       upload_completed_at: new Date().toISOString(),
       processing_started_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
@@ -385,21 +450,34 @@ class VideoService {
     const isAdmin = user.user_metadata?.role === 'ADMIN' || user.role === 'ADMIN' || userEmail === 'admin@internnetra.com';
 
     // 1. Fetch Target Course & Lesson
-    const { data: course, error: courseErr } = await supabase
-      .from('courses')
-      .select('id, title, slug, curriculum_modules')
-      .or(`id.eq.${courseId},slug.eq.${courseId}`)
-      .maybeSingle();
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(courseId));
+    let courseQuery = supabase.from('courses').select('id, title, slug, curriculum_modules');
+    if (isUUID) {
+      courseQuery = courseQuery.or(`id.eq.${courseId},slug.eq.${courseId}`);
+    } else {
+      courseQuery = courseQuery.eq('slug', courseId);
+    }
+    const { data: course, error: courseErr } = await courseQuery.maybeSingle();
 
     if (courseErr || !course) {
       throw { statusCode: 404, message: 'Course not found.' };
     }
 
-    // Locate lesson in course modules
+    // Locate target module or lesson in course curriculum
     let targetLesson = null;
     let targetModule = null;
     if (Array.isArray(course.curriculum_modules)) {
       for (const mod of course.curriculum_modules) {
+        if (String(mod.id) === String(lessonId) || String(mod.video_asset_id) === String(lessonId)) {
+          targetModule = mod;
+          targetLesson = {
+            id: mod.id,
+            title: mod.video_title || mod.title || mod.name,
+            video_url: mod.video_url,
+            is_preview: mod.is_preview
+          };
+          break;
+        }
         if (Array.isArray(mod.lessons)) {
           const l = mod.lessons.find(item => String(item.id) === String(lessonId));
           if (l) {
@@ -411,8 +489,8 @@ class VideoService {
       }
     }
 
-    // Check if free preview lesson
-    const isFreePreview = Boolean(targetLesson?.is_preview);
+    // Check if free preview lesson/module
+    const isFreePreview = Boolean(targetLesson?.is_preview || targetModule?.is_preview);
 
     // 2. Authorization Check: Admin or Active Enrolled Student or Free Preview
     let studentId = null;
@@ -469,15 +547,12 @@ class VideoService {
     }
 
     // 3. Verify Video Metadata & Readiness
+    const s3PathUtils = require('../../utils/s3PathUtils');
     let videoRecord = await this.getVideoRecord(lessonId);
-    let masterUrl = videoRecord?.hls_master_url || targetLesson?.video_url;
-
-    if (!masterUrl && targetLesson?.video_url) {
-      masterUrl = targetLesson.video_url;
-    }
+    let masterUrl = videoRecord?.hls_master_url || targetLesson?.video_url || targetModule?.video_url;
 
     if (!masterUrl) {
-      throw { statusCode: 404, message: 'Video lecture not yet available for this lesson.' };
+      throw { statusCode: 404, message: 'Video lecture not yet available for this module.' };
     }
 
     // 4. Retrieve Resume Position from lesson_video_progress
@@ -497,8 +572,10 @@ class VideoService {
       } catch (e) {}
     }
 
-    // 5. Generate CloudFront Signed Authorization
-    const resourcePrefix = `courses/${course.id}/modules/${targetModule?.id || 'general'}/lessons/${lessonId}/`;
+    // 5. Generate CloudFront Signed Authorization (Dynamic for human-readable slug paths or legacy UUID paths)
+    const resourcePrefix = s3PathUtils.extractResourcePrefixFromUrl(masterUrl) ||
+      `courses/${course.id}/modules/${targetModule?.id || 'general'}/lessons/${lessonId}/`;
+
     const signedCookiesData = cloudFrontVideoService.generateHlsSignedCookies({
       resourcePath: resourcePrefix,
       expiresInSeconds: 14400 // 4 Hours
@@ -513,7 +590,7 @@ class VideoService {
       status: 'AUTHORIZED',
       lessonId,
       courseId: course.id,
-      title: targetLesson?.title || 'Lesson Video',
+      title: targetLesson?.title || targetModule?.title || 'Module Video',
       streamUrl: signedStreamUrl,
       hlsMasterUrl: masterUrl,
       cookies: signedCookiesData.cookies,

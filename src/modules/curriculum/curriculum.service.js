@@ -163,8 +163,17 @@ class CurriculumService {
       title: mod.title || mod.name || `Module ${idx + 1}`,
       description: mod.description || '',
       duration_minutes: mod.duration_minutes || 60,
+      duration_hours: mod.duration_hours || Math.round(((mod.duration_minutes || 60) / 60) * 10) / 10,
       duration: mod.duration || '1 hr',
-      lessons: Array.isArray(mod.lessons) ? mod.lessons : []
+      video_url: mod.video_url || '',
+      video_status: mod.video_status || (mod.video_url ? 'READY' : 'NO_VIDEO'),
+      video_title: mod.video_title || mod.title || mod.name || `Module ${idx + 1} Video`,
+      video_asset_id: mod.video_asset_id || null,
+      video_error_message: mod.video_error_message || '',
+      topics: Array.isArray(mod.topics) ? mod.topics : (Array.isArray(mod.lessons) ? mod.lessons : []),
+      lessons: Array.isArray(mod.lessons) ? mod.lessons : (Array.isArray(mod.topics) ? mod.topics : []),
+      is_preview: Boolean(mod.is_preview),
+      is_published: mod.is_published !== undefined ? Boolean(mod.is_published) : true
     }));
   }
 
@@ -214,13 +223,23 @@ class CurriculumService {
 
     const newModule = {
       id: newModuleId,
-      name: data.name,
-      title: data.name,
+      name: data.name || data.title,
+      title: data.title || data.name,
       description: data.description || '',
       duration: data.duration || durationHrsStr,
       duration_minutes: durationMins,
+      duration_hours: Math.round((durationMins / 60) * 10) / 10,
       display_order: existingModules.length + 1,
-      lessons: Array.isArray(data.lessons) ? data.lessons : []
+      video_url: data.video_url || '',
+      video_status: data.video_status || (data.video_url ? 'READY' : 'NO_VIDEO'),
+      video_title: data.video_title || data.title || data.name,
+      video_asset_id: data.video_asset_id || null,
+      video_error_message: data.video_error_message || '',
+      topics: Array.isArray(data.topics) ? data.topics : (Array.isArray(data.lessons) ? data.lessons : []),
+      lessons: Array.isArray(data.lessons) ? data.lessons : (Array.isArray(data.topics) ? data.topics : []),
+      is_preview: Boolean(data.is_preview),
+      is_published: data.is_published !== undefined ? Boolean(data.is_published) : true,
+      updated_at: new Date().toISOString()
     };
 
     existingModules.push(newModule);
@@ -290,7 +309,15 @@ class CurriculumService {
       duration_minutes: durationMins,
       duration: updateData.duration || durationHrsStr,
       duration_hours: Math.round((durationMins / 60) * 10) / 10,
-      lessons: Array.isArray(updateData.lessons) ? updateData.lessons : existingMod.lessons || [],
+      video_url: updateData.video_url !== undefined ? updateData.video_url : (existingMod.video_url || ''),
+      video_status: updateData.video_status !== undefined ? updateData.video_status : (existingMod.video_status || (updateData.video_url || existingMod.video_url ? 'READY' : 'NO_VIDEO')),
+      video_title: updateData.video_title !== undefined ? updateData.video_title : (existingMod.video_title || existingMod.title),
+      video_asset_id: updateData.video_asset_id !== undefined ? updateData.video_asset_id : (existingMod.video_asset_id || null),
+      video_error_message: updateData.video_error_message !== undefined ? updateData.video_error_message : (existingMod.video_error_message || ''),
+      topics: Array.isArray(updateData.topics) ? updateData.topics : (existingMod.topics || existingMod.lessons || []),
+      lessons: Array.isArray(updateData.lessons) ? updateData.lessons : (Array.isArray(updateData.topics) ? updateData.topics : existingMod.lessons || []),
+      is_preview: updateData.is_preview !== undefined ? Boolean(updateData.is_preview) : Boolean(existingMod.is_preview),
+      is_published: updateData.is_published !== undefined ? Boolean(updateData.is_published) : (existingMod.is_published !== undefined ? Boolean(existingMod.is_published) : true),
       updated_at: new Date().toISOString()
     };
 
@@ -1023,6 +1050,13 @@ class CurriculumService {
           display_order: m.display_order || idx + 1,
           duration: m.duration || durationHrsStr,
           duration_minutes: durationMins,
+          duration_hours: m.duration_hours || Math.round((durationMins / 60) * 10) / 10,
+          video_url: m.video_url || formattedLessons[0]?.video_url || '',
+          video_status: m.video_status || (m.video_url || formattedLessons[0]?.video_url ? 'READY' : 'NO_VIDEO'),
+          video_title: m.video_title || m.title || m.name,
+          video_asset_id: m.video_asset_id || null,
+          video_error_message: m.video_error_message || '',
+          topics: Array.isArray(m.topics) ? m.topics : formattedLessons.map(l => ({ id: l.id, title: l.title })),
           videos: videoCount,
           lessons: formattedLessons
         };
