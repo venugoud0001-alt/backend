@@ -322,9 +322,11 @@ class VideoService {
           }
 
           if (Array.isArray(mod.lessons)) {
+            let lessonMatched = false;
             const updatedLessons = mod.lessons.map(l => {
               if (String(l.id) === String(record.lesson_id)) {
                 modified = true;
+                lessonMatched = true;
                 return {
                   ...l,
                   video_url: record.hls_master_url,
@@ -333,10 +335,18 @@ class VideoService {
               }
               return l;
             });
+
+            if (lessonMatched) {
+              return {
+                ...mod,
+                video_url: record.hls_master_url,
+                video_status: VIDEO_STATUS.READY,
+                lessons: updatedLessons
+              };
+            }
+
             return {
               ...mod,
-              video_url: mod.video_url || record.hls_master_url,
-              video_status: mod.video_status || VIDEO_STATUS.READY,
               lessons: updatedLessons
             };
           }
