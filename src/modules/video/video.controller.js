@@ -182,23 +182,15 @@ class VideoController {
       const cmd = new GetObjectCommand({ Bucket: bucket, Key: s3Key });
       const s3Res = await s3.send(cmd);
 
-      // Handle M3U8 Playlists: Rewrite relative URLs to route through /api/video/hls-stream/
+      // Handle M3U8 Playlists: Send manifest with correct HLS MIME type & CORS
       if (s3Key.endsWith('.m3u8')) {
         const rawContent = await s3Res.Body.transformToString();
-        const basePath = s3Key.substring(0, s3Key.lastIndexOf('/') + 1);
-
-        const rewritten = rawContent.split('\n').map(line => {
-          const trimmed = line.trim();
-          if (trimmed && !trimmed.startsWith('#') && !trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
-            return `/api/video/hls-stream/${basePath}${trimmed}`;
-          }
-          return line;
-        }).join('\n');
-
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Access-Control-Allow-Origin', '*');
-        return res.send(rewritten);
+        res.setHeader('Access-Control-Allow-Headers', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+        return res.send(rawContent);
       }
 
       // Handle TS Video Chunks: Stream binary directly with byte ranges
