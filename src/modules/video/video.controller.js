@@ -161,6 +161,20 @@ class VideoController {
    */
   async streamHlsFile(req, res, next) {
     try {
+      const origin = req.headers.origin;
+      if (origin) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+      } else {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+      }
+      res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Range');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+
+      if (req.method === 'OPTIONS') {
+        return res.sendStatus(204);
+      }
+
       const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
       const env = require('../../config/env');
       const s3 = new S3Client({
@@ -187,9 +201,6 @@ class VideoController {
         const rawContent = await s3Res.Body.transformToString();
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Headers', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
         return res.send(rawContent);
       }
 
@@ -200,7 +211,6 @@ class VideoController {
       res.setHeader('Content-Type', s3Res.ContentType || 'video/mp2t');
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Cache-Control', 'public, max-age=86400');
-      res.setHeader('Access-Control-Allow-Origin', '*');
 
       s3Res.Body.pipe(res);
     } catch (err) {
