@@ -213,12 +213,16 @@ async function getStudentEnrollments(req, res) {
         : Math.min(100, Math.round((completed / totalLessons) * 100));
 
       const totalAmt = Number(enr.total_amount || course?.price || 4000);
-      const paidAmt = Number(enr.amount_paid || 0);
-      const pendingAmt = Number(
-        enr.amount_pending !== undefined && enr.amount_pending !== null
-          ? enr.amount_pending
-          : Math.max(0, totalAmt - paidAmt)
-      );
+      const isSettled = enr.payment_status === 'PAID';
+      const rawPaid = Number(enr.amount_paid || 0);
+      const paidAmt = isSettled ? totalAmt : Math.min(totalAmt, rawPaid);
+      const pendingAmt = isSettled
+        ? 0
+        : Number(
+            enr.amount_pending !== undefined && enr.amount_pending !== null
+              ? enr.amount_pending
+              : Math.max(0, totalAmt - paidAmt)
+          );
 
       const accessStart = enr.access_start_date || enr.created_at || new Date().toISOString();
       const accessExpiry = enr.access_expiry_date || addCalendarMonths(accessStart, 6).toISOString();

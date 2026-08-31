@@ -6,6 +6,15 @@ const ALLOWED_DISCOUNT_TYPES = ['PERCENTAGE', 'FIXED_AMOUNT'];
 const ALLOWED_STATUSES = ['ACTIVE', 'DISABLED', 'EXPIRED', 'SCHEDULED', 'EXHAUSTED'];
 const ALLOWED_APPLICABILITY = ['GLOBAL', 'COURSE', 'DEPARTMENT'];
 
+function sanitizeExpiryDate(dateStr) {
+  if (!dateStr) return null;
+  const str = String(dateStr).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
+    return new Date(`${str}T23:59:59.999Z`).toISOString();
+  }
+  return new Date(str).toISOString();
+}
+
 /**
  * Validate coupon creation input
  */
@@ -68,6 +77,13 @@ function validateCreateCoupon(req) {
     return { isValid: false, error: `Invalid status. Must be one of: ${ALLOWED_STATUSES.join(', ')}.` };
   }
 
+  const parsedStartsAt = starts_at ? new Date(starts_at).toISOString() : new Date().toISOString();
+  const parsedExpiresAt = expires_at ? sanitizeExpiryDate(expires_at) : null;
+
+  if (parsedExpiresAt && parsedStartsAt && new Date(parsedExpiresAt) < new Date(parsedStartsAt)) {
+    return { isValid: false, error: 'expires_at cannot be earlier than starts_at.' };
+  }
+
   return {
     isValid: true,
     sanitizedData: {
@@ -76,8 +92,8 @@ function validateCreateCoupon(req) {
       discount_type: type,
       discount_value: val,
       status: currentStatus,
-      starts_at: starts_at ? new Date(starts_at).toISOString() : new Date().toISOString(),
-      expires_at: expires_at ? new Date(expires_at).toISOString() : null,
+      starts_at: parsedStartsAt,
+      expires_at: parsedExpiresAt,
       usage_limit: usage_limit !== undefined && usage_limit !== null && usage_limit !== '' ? Math.max(1, Number(usage_limit)) : null,
       per_user_limit: per_user_limit !== undefined && per_user_limit !== null && per_user_limit !== '' ? Math.max(1, Number(per_user_limit)) : 1,
       minimum_course_amount: minimum_course_amount !== undefined ? Math.max(0, Number(minimum_course_amount)) : 0,
@@ -144,7 +160,10 @@ function validateUpdateCoupon(req) {
   }
 
   if (body.starts_at !== undefined) sanitizedData.starts_at = body.starts_at ? new Date(body.starts_at).toISOString() : new Date().toISOString();
-  if (body.expires_at !== undefined) sanitizedData.expires_at = body.expires_at ? new Date(body.expires_at).toISOString() : null;
+  if (body.expires_at !== undefined) sanitizedData.expires_at = body.expires_at ? sanitizeExpiryDate(body.expires_at) : null;
+  if (sanitizedData.starts_at && sanitizedData.expires_at && new Date(sanitizedData.expires_at) < new Date(sanitizedData.starts_at)) {
+    return { isValid: false, error: 'expires_at cannot be earlier than starts_at.' };
+  }
   if (body.usage_limit !== undefined) sanitizedData.usage_limit = body.usage_limit ? Math.max(1, Number(body.usage_limit)) : null;
   if (body.per_user_limit !== undefined) sanitizedData.per_user_limit = Math.max(1, Number(body.per_user_limit));
   if (body.minimum_course_amount !== undefined) sanitizedData.minimum_course_amount = Math.max(0, Number(body.minimum_course_amount));

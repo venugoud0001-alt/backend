@@ -553,13 +553,7 @@ class CouponService {
 
     console.log("  Eligibility Result: ALLOWED");
 
-    // 6. Minimum Course Amount Check
-    const coursePrice = Number(course.price || 0);
-    if (coupon.minimum_course_amount && coursePrice < Number(coupon.minimum_course_amount)) {
-      throw { statusCode: 422, message: `Minimum course total of ₹${coupon.minimum_course_amount} required to use coupon '${cleanCode}'.` };
-    }
-
-    // 7. Calculate Pricing Breakdown via Canonical Pricing Engine
+    // 6. Calculate Pricing Breakdown via Canonical Pricing Engine
     const pricingService = require('../pricing/pricing.service');
     const pricingData = await pricingService.getPricingForCourse(course.id).catch(() => null);
     const plans = pricingData?.pricingPlans || [];
@@ -568,6 +562,12 @@ class CouponService {
     const targetMode = String(paymentMode || 'FULL').toUpperCase();
     const activePlan = targetMode === 'INSTALLMENT' ? (instPlan || fullPlan) : (fullPlan || instPlan);
     const activePhases = instPlan?.phases || [];
+
+    // 7. Minimum Course Amount Check
+    const coursePrice = Number(course.price || activePlan?.totalAmount || 0);
+    if (coupon.minimum_course_amount && coursePrice < Number(coupon.minimum_course_amount)) {
+      throw { statusCode: 422, message: `Minimum course total of ₹${coupon.minimum_course_amount} required to use coupon '${cleanCode}'.` };
+    }
 
     const breakdown = calculateDiscountedPricing({
       course,
@@ -600,7 +600,8 @@ class CouponService {
 
     const { description: cleanDescription, meta } = this.parseCouponMetadata(c.description);
 
-    let computedStatus = (c.status || meta?.status || 'ACTIVE').toUpperCase();
+    let baseStatus = (c.status || meta?.status || 'ACTIVE').toUpperCase();
+    let computedStatus = baseStatus;
 
     const expiresAt = c.expires_at || meta?.expires_at || null;
     const startsAt = c.starts_at || meta?.starts_at || null;
@@ -609,12 +610,16 @@ class CouponService {
       : (meta?.usage_limit ? Number(meta.usage_limit) : null);
     const usedCount = Number(c.used_count !== undefined ? c.used_count : (meta?.used_count || 0));
 
-    if (expiresAt && new Date(expiresAt) < now) {
-      computedStatus = 'EXPIRED';
-    } else if (startsAt && new Date(startsAt) > now) {
-      computedStatus = 'SCHEDULED';
-    } else if (usageLimit && usedCount >= usageLimit) {
-      computedStatus = 'EXHAUSTED';
+    if (baseStatus !== 'DISABLED') {
+      if (expiresAt && new Date(expiresAt) < now) {
+        computedStatus = 'EXPIRED';
+      } else if (startsAt && new Date(startsAt) > now) {
+        computedStatus = 'SCHEDULED';
+      } else if (usageLimit && usedCount >= usageLimit) {
+        computedStatus = 'EXHAUSTED';
+      } else {
+        computedStatus = 'ACTIVE';
+      }
     }
 
     const discountType = (c.discount_type || meta?.discount_type || 'PERCENTAGE').toUpperCase();

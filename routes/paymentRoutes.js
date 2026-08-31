@@ -499,18 +499,33 @@ router.post(['/payments/verify-order', '/payments/verify'], async (req, res, nex
         const courseName = (cfOrderData.order_note || "").replace("Enrollment - ", "").replace("Registration Token - ", "") || matchedEnrollment?.course_name || "Live Program";
         const txnId = cfOrderData.cf_order_id ? String(cfOrderData.cf_order_id) : `CF_${orderId}`;
 
-        if (matchedOrder?.installment_number > 1 && matchedEnrollment) {
-          const prevPaid = Number(matchedEnrollment.amount_paid) || 0;
-          const cumPaid = prevPaid + amountPaid;
+        // Ensure order is recorded as PAID first
+        await supabase.from("orders").update({
+          status: "PAID",
+          amount: amountPaid
+        }).eq("cashfree_order_id", orderId);
+
+        if (matchedEnrollment) {
+          // Authoritatively compute cumulative paid amount from all PAID orders for this enrollment
+          const { data: allPaidOrders } = await supabase
+            .from("orders")
+            .select("amount")
+            .eq("enrollment_id", matchedEnrollment.id)
+            .eq("status", "PAID");
+
+          let actualSumPaid = 0;
+          if (Array.isArray(allPaidOrders) && allPaidOrders.length > 0) {
+            actualSumPaid = allPaidOrders.reduce((sum, o) => sum + (Number(o.amount) || 0), 0);
+          } else {
+            actualSumPaid = amountPaid;
+          }
+
+          // Accounting Invariant: amount_paid can never exceed totalFee
+          const cumPaid = Math.min(totalFee, actualSumPaid);
           remainingBal = Math.max(0, totalFee - cumPaid);
           isFullPaid = remainingBal <= 0;
+
           matchedEnrollment.amount_paid = cumPaid;
-          matchedEnrollment.amount_pending = remainingBal;
-          matchedEnrollment.payment_status = isFullPaid ? "PAID" : "PARTIALLY_PAID";
-        } else if (matchedEnrollment) {
-          remainingBal = Math.max(0, totalFee - amountPaid);
-          isFullPaid = remainingBal <= 0;
-          matchedEnrollment.amount_paid = amountPaid;
           matchedEnrollment.amount_pending = remainingBal;
           matchedEnrollment.payment_status = isFullPaid ? "PAID" : "PARTIALLY_PAID";
         }
@@ -529,11 +544,6 @@ router.post(['/payments/verify-order', '/payments/verify'], async (req, res, nex
           status: isFullPaid ? "Full Payment Settled" : `1st Installment Settled (Balance ₹${remainingBal.toLocaleString()} Due)`,
           created_at: new Date().toISOString()
         }], { onConflict: "txn_id" });
-
-        await supabase.from("orders").update({
-          status: "PAID",
-          amount: amountPaid
-        }).eq("cashfree_order_id", orderId);
 
         if (matchedOrder?.enrollment_id) {
           const nowIso = new Date().toISOString();
