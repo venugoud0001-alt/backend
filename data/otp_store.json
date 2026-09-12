@@ -1,0 +1,12 @@
+{
+  "admin@internnetra.com": {
+    "email": "admin@internnetra.com",
+    "otpHash": "c354bb1398f00678efac3fb22845e9b03236188f024429bcdccf72309e7f4f51",
+    "expiresAt": 1789194539763,
+    "attempts": 0,
+    "maxAttempts": 5,
+    "fullName": "Student",
+    "used": false,
+    "createdAt": 1789193939763
+  }
+}

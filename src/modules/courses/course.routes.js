@@ -12,8 +12,8 @@ router.get('/courses/id/:id', courseController.getCourseById);
 router.get('/courses/slug/:slug', courseController.getCourseBySlug);
 router.get('/courses/:identifier', courseController.getCourseByIdentifier);
 router.get('/batches', courseController.getBatches);
-router.get('/admin/academic-stats', courseController.getAcademicStats);
-router.get('/academic-stats', courseController.getAcademicStats);
+router.get('/admin/academic-stats', authenticateJWT, requireAdminRole, courseController.getAcademicStats);
+router.get('/academic-stats', authenticateJWT, requireAdminRole, courseController.getAcademicStats);
 
 // Admin Protected Routes
 router.post('/admin/create-batch', authenticateJWT, requirePermission('course.create'), courseController.createBatch);

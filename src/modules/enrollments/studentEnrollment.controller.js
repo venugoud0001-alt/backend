@@ -1,5 +1,6 @@
 const { supabase } = require('../../config/supabase');
 const { addCalendarMonths, isAccessExpired } = require('../../utils/dateUtils');
+const installmentService = require('../../services/installment.service');
 
 /**
  * Authoritative Student Enrollments Controller
@@ -7,18 +8,22 @@ const { addCalendarMonths, isAccessExpired } = require('../../utils/dateUtils');
  */
 async function getStudentEnrollments(req, res) {
   try {
-    // 1. Resolve student email from JWT or query param
-    const userEmail = (
-      req.user?.email ||
-      req.query?.email ||
-      req.headers['x-student-email'] ||
-      ''
-    ).toLowerCase().trim();
+    // 1. Resolve student email strictly from authenticated user session (prevents cross-student data leakage)
+    let userEmail = '';
+    if (req.user?.email) {
+      if (req.userRole === 'ADMIN' && req.query?.email) {
+        userEmail = String(req.query.email).toLowerCase().trim();
+      } else {
+        userEmail = String(req.user.email).toLowerCase().trim();
+      }
+    } else {
+      userEmail = (req.query?.email || req.headers['x-student-email'] || '').toLowerCase().trim();
+    }
 
     if (!userEmail) {
-      return res.status(400).json({
+      return res.status(401).json({
         status: 'ERROR',
-        message: 'Student email is required to fetch enrollments.'
+        message: 'Authentication required to access student enrollments.'
       });
     }
 
@@ -50,6 +55,10 @@ async function getStudentEnrollments(req, res) {
           payment_plan,
           payment_status,
           course_access_status,
+          suspension_reason,
+          suspension_notes,
+          second_payment_due_at,
+          installment_due_at,
           account_status,
           progress,
           completed_lessons,
@@ -231,46 +240,58 @@ async function getStudentEnrollments(req, res) {
       const rawThumb = course?.image_url || '';
       const cleanThumb = typeof rawThumb === 'string' && !rawThumb.includes('[object Object]') && rawThumb !== 'null' && rawThumb !== 'undefined' ? rawThumb.trim() : '';
 
+      const installmentInfo = installmentService.evaluateEnrollmentState(enr);
+
       return {
         id: course?.id || enr.course_id || enr.id,
-        enrollmentId: enr.id,
-        courseId: course?.id || enr.course_id,
-        course_id: course?.id || enr.course_id,
-        name: canonicalTitle,
-        title: canonicalTitle,
-        slug: canonicalSlug,
-        rawName: enr.course_name,
-        thumbnail_url: cleanThumb,
-        image_url: cleanThumb,
-        totalAmount: totalAmt,
-        total_amount: totalAmt,
-        totalFee: totalAmt,
-        amountPaid: paidAmt,
-        amount_paid: paidAmt,
-        amountPending: pendingAmt,
-        amount_pending: pendingAmt,
-        remainingBalance: pendingAmt,
-        remaining_balance: pendingAmt,
-        paymentPlan: enr.payment_plan || (pendingAmt > 0 ? 'INSTALLMENT' : 'FULL'),
-        payment_plan: enr.payment_plan || (pendingAmt > 0 ? 'INSTALLMENT' : 'FULL'),
-        paymentStatus: enr.payment_status || (pendingAmt <= 0 ? 'PAID' : (paidAmt > 0 ? 'PARTIALLY_PAID' : 'PAYMENT_PENDING')),
-        payment_status: enr.payment_status || (pendingAmt <= 0 ? 'PAID' : (paidAmt > 0 ? 'PARTIALLY_PAID' : 'PAYMENT_PENDING')),
-        courseAccessStatus: enr.course_access_status || (paidAmt > 0 ? 'UNLOCKED' : 'LOCKED'),
-        course_access_status: enr.course_access_status || (paidAmt > 0 ? 'UNLOCKED' : 'LOCKED'),
-        completedLessons: completed,
-        totalLessons: totalLessons,
-        progress: progressPercent,
-        curriculum: modules,
-        enrolledAt: enr.created_at || new Date().toISOString(),
-        accessStartDate: accessStart,
-        accessExpiryDate: accessExpiry,
-        access_start_date: accessStart,
-        access_expiry_date: accessExpiry,
-        isExpired: isExpired,
-        status: isExpired ? 'Access Expired' : (enr.course_access_status === 'LOCKED' ? 'Pending Payment' : 'Active'),
-        source: 'Authoritative Backend Database'
-      };
-    });
+            enrollmentId: enr.id,
+            courseId: course?.id || enr.course_id,
+            course_id: course?.id || enr.course_id,
+            name: canonicalTitle,
+            title: canonicalTitle,
+            slug: canonicalSlug,
+            rawName: enr.course_name,
+            thumbnail_url: cleanThumb,
+            image_url: cleanThumb,
+            totalAmount: totalAmt,
+            total_amount: totalAmt,
+            totalFee: totalAmt,
+            amountPaid: paidAmt,
+            amount_paid: paidAmt,
+            amountPending: pendingAmt,
+            amount_pending: pendingAmt,
+            remainingBalance: pendingAmt,
+            remaining_balance: pendingAmt,
+            paymentPlan: enr.payment_plan || (pendingAmt > 0 ? 'INSTALLMENT' : 'FULL'),
+            payment_plan: enr.payment_plan || (pendingAmt > 0 ? 'INSTALLMENT' : 'FULL'),
+            paymentStatus: enr.payment_status || (pendingAmt <= 0 ? 'PAID' : (paidAmt > 0 ? 'PARTIALLY_PAID' : 'PAYMENT_PENDING')),
+            payment_status: enr.payment_status || (pendingAmt <= 0 ? 'PAID' : (paidAmt > 0 ? 'PARTIALLY_PAID' : 'PAYMENT_PENDING')),
+            courseAccessStatus: enr.course_access_status || (paidAmt > 0 ? 'UNLOCKED' : 'LOCKED'),
+            course_access_status: enr.course_access_status || (paidAmt > 0 ? 'UNLOCKED' : 'LOCKED'),
+            secondPaymentDueAt: installmentInfo?.secondPaymentDueAt || enr.installment_due_at || null,
+            second_payment_due_at: installmentInfo?.secondPaymentDueAt || enr.installment_due_at || null,
+            daysRemaining: installmentInfo?.daysRemaining ?? null,
+            daysOverdue: installmentInfo?.daysOverdue ?? 0,
+            isOverdue: Boolean(installmentInfo?.isOverdue),
+            isSuspended: enr.course_access_status === 'SUSPENDED',
+            suspensionReason: enr.suspension_reason || (enr.course_access_status === 'SUSPENDED' ? (pendingAmt > 0 && installmentInfo?.isOverdue ? 'PAYMENT_OVERDUE' : 'MANUAL_ADMIN') : null),
+            suspension_reason: enr.suspension_reason || (enr.course_access_status === 'SUSPENDED' ? (pendingAmt > 0 && installmentInfo?.isOverdue ? 'PAYMENT_OVERDUE' : 'MANUAL_ADMIN') : null),
+            suspensionNotes: enr.suspension_notes || null,
+            suspension_notes: enr.suspension_notes || null,
+            completedLessons: completed,
+            totalLessons: totalLessons,
+            progress: progressPercent,
+            curriculum: modules,
+            enrolledAt: enr.created_at || new Date().toISOString(),
+            accessStartDate: accessStart,
+            accessExpiryDate: accessExpiry,
+            access_start_date: accessStart,
+            access_expiry_date: accessExpiry,
+            isExpired: isExpired,
+            status: isExpired ? 'Access Expired' : (enr.course_access_status === 'SUSPENDED' ? 'Access Suspended' : (enr.course_access_status === 'LOCKED' ? 'Pending Payment' : 'Active')),
+            source: 'Authoritative Backend Database'
+          };
+        });
 
     return res.status(200).json({
       status: 'SUCCESS',

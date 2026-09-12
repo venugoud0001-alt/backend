@@ -92,24 +92,57 @@ function sanitizeS3FileName(fileName, fallbackPrefix = 'video') {
 
 /**
  * Builds the full S3 source object key
+ * Supports both isolated structure: courses/{courseSlug}/modules/{moduleSlug}/videos/{videoId}/source/{filename}
+ * and backward-compatible legacy structure: courses/{courseSlug}/modules/{moduleSlug}/source/{filename}
  */
-function buildS3SourceKey(courseSlug, moduleSlug, fileName) {
-  const cleanFileName = sanitizeS3FileName(fileName);
+function buildS3SourceKey(courseSlug, moduleSlug, videoIdOrFileName, optionalFileName) {
+  let videoId = null;
+  let rawFileName = videoIdOrFileName;
+
+  if (optionalFileName) {
+    videoId = String(videoIdOrFileName).trim();
+    rawFileName = optionalFileName;
+  }
+
+  const cleanFileName = sanitizeS3FileName(rawFileName);
+
+  if (videoId) {
+    return `courses/${courseSlug}/modules/${moduleSlug}/videos/${videoId}/source/${cleanFileName}`;
+  }
   return `courses/${courseSlug}/modules/${moduleSlug}/source/${cleanFileName}`;
 }
 
-/**
- * Builds the S3 HLS prefix for MediaConvert outputs
- */
-function buildS3HlsPrefix(courseSlug, moduleSlug) {
+function buildS3HlsPrefix(courseSlug, moduleSlug, optionalVideoId) {
+  if (optionalVideoId) {
+    const cleanVideoId = String(optionalVideoId).trim();
+    return `courses/${courseSlug}/modules/${moduleSlug}/videos/${cleanVideoId}/hls/`;
+  }
   return `courses/${courseSlug}/modules/${moduleSlug}/hls/`;
 }
 
 /**
+ * Builds the S3 HLS prefix for individual Topic MediaConvert outputs
+ * Structure: courses/{courseSlug}/modules/{moduleSlug}/videos/{sourceVideoId}/topics/{topicId}/hls/
+ */
+function buildS3TopicHlsPrefix(courseSlug, moduleSlug, sourceVideoId, topicId) {
+  const cleanSourceId = String(sourceVideoId).trim();
+  const cleanTopicId = String(topicId).trim();
+  return `courses/${courseSlug}/modules/${moduleSlug}/videos/${cleanSourceId}/topics/${cleanTopicId}/hls/`;
+}
+
+/**
+ * Builds the S3 master playlist key for a topic
+ */
+function buildS3TopicMasterKey(courseSlug, moduleSlug, sourceVideoId, topicId) {
+  const prefix = buildS3TopicHlsPrefix(courseSlug, moduleSlug, sourceVideoId, topicId);
+  return `${prefix}master.m3u8`;
+}
+
+/**
  * Extracts CloudFront resource prefix from an HLS master playlist URL
- * Supports both new slug structure and legacy UUID paths
+ * Supports isolated videoId paths, slug structures, and legacy paths
  * @param {string} masterUrl - Master m3u8 URL or S3 key
- * @returns {string} e.g. "courses/cyber-security/modules/01-fundamentals/hls/"
+ * @returns {string} e.g. "courses/cyber-security/modules/01-fundamentals/videos/uuid-123/hls/"
  */
 function extractResourcePrefixFromUrl(masterUrl) {
   if (!masterUrl || typeof masterUrl !== 'string') return '';
@@ -119,6 +152,10 @@ function extractResourcePrefixFromUrl(masterUrl) {
     const masterIdx = pathname.lastIndexOf('master.m3u8');
     if (masterIdx !== -1) {
       return pathname.substring(0, masterIdx);
+    }
+    const hlsIdx = pathname.lastIndexOf('/hls/');
+    if (hlsIdx !== -1) {
+      return pathname.substring(0, hlsIdx + 5);
     }
     const lastSlash = pathname.lastIndexOf('/');
     if (lastSlash !== -1) {
@@ -136,5 +173,9 @@ module.exports = {
   sanitizeS3FileName,
   buildS3SourceKey,
   buildS3HlsPrefix,
+  buildS3TopicHlsPrefix,
+  buildS3TopicMasterKey,
   extractResourcePrefixFromUrl
 };
+
+

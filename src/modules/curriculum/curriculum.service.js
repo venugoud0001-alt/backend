@@ -1,5 +1,6 @@
 const { supabase } = require('../../config/supabase');
 const { generateSlug } = require('../../utils/slug');
+const { classifyIdentifier, normalizeIdentifier, isUUID } = require('../../utils/idValidator');
 const courseService = require('../courses/course.service');
 
 // Helper to safely execute Supabase query catching PGRST205 table cache missing error
@@ -172,19 +173,42 @@ class CurriculumService {
       video_error_message: mod.video_error_message || '',
       topics: Array.isArray(mod.topics) ? mod.topics : (Array.isArray(mod.lessons) ? mod.lessons : []),
       lessons: Array.isArray(mod.lessons) ? mod.lessons : (Array.isArray(mod.topics) ? mod.topics : []),
-      is_preview: Boolean(mod.is_preview),
+      is_preview: Boolean(mod.is_preview || mod.is_free_preview),
+      is_free_preview: Boolean(mod.is_preview || mod.is_free_preview),
       is_published: mod.is_published !== undefined ? Boolean(mod.is_published) : true
     }));
   }
 
-  async getModuleById(id) {
+  async getModuleById(id, explicitCourseId = null) {
     if (!id) return null;
-    const { data: courses } = await supabase.from('courses').select('*');
+    const cleanId = String(id).trim().toLowerCase();
+
+    if (explicitCourseId) {
+      const course = (await courseService.getCourseById(explicitCourseId, true).catch(() => null)) ||
+                     (await courseService.getCourseBySlug(explicitCourseId, true).catch(() => null));
+      if (course && Array.isArray(course.curriculum_modules)) {
+        const mod = course.curriculum_modules.find((m, idx) =>
+          String(m.id || '').trim().toLowerCase() === cleanId ||
+          `mod_${idx + 1}`.toLowerCase() === cleanId ||
+          String(idx + 1) === cleanId
+        );
+        if (mod) return { ...mod, id: mod.id || `mod_${id}`, course_id: course.id };
+      }
+      return null;
+    }
+
+    // If no courseId is provided, reject all legacy identifiers (numeric, mod_X, slugs, etc.)
+    // Only strictly valid UUIDs are globally searchable
+    if (!isUUID(cleanId)) {
+      return null;
+    }
+
+    const { data: courses } = await supabase.from('courses').select('id, curriculum_modules');
     if (!courses) return null;
     for (const c of courses) {
       if (Array.isArray(c.curriculum_modules)) {
-        const mod = c.curriculum_modules.find((m, idx) => String(m.id || `mod_${idx + 1}`) === String(id));
-        if (mod) return { ...mod, id: mod.id || `mod_${id}`, course_id: c.id };
+        const mod = c.curriculum_modules.find((m) => m && String(m.id).toLowerCase() === cleanId);
+        if (mod) return { ...mod, id: mod.id, course_id: c.id };
       }
     }
     return null;
@@ -237,7 +261,8 @@ class CurriculumService {
       video_error_message: data.video_error_message || '',
       topics: Array.isArray(data.topics) ? data.topics : (Array.isArray(data.lessons) ? data.lessons : []),
       lessons: Array.isArray(data.lessons) ? data.lessons : (Array.isArray(data.topics) ? data.topics : []),
-      is_preview: Boolean(data.is_preview),
+      is_preview: Boolean(data.is_preview !== undefined ? data.is_preview : data.is_free_preview),
+      is_free_preview: Boolean(data.is_preview !== undefined ? data.is_preview : data.is_free_preview),
       is_published: data.is_published !== undefined ? Boolean(data.is_published) : true,
       updated_at: new Date().toISOString()
     };
@@ -256,38 +281,43 @@ class CurriculumService {
     return newModule;
   }
 
-  async updateModule(id, updateData) {
+  async updateModule(id, updateData, explicitCourseId = null) {
     if (!id) {
       throw { statusCode: 400, message: 'Module ID is required.' };
     }
 
-    const { data: courses } = await supabase.from('courses').select('*');
-    if (!courses) throw { statusCode: 404, message: 'Course not found.' };
-
-    let targetCourse = null;
-    let targetModuleIndex = -1;
-
-    for (const c of courses) {
-      if (Array.isArray(c.curriculum_modules)) {
-        const idx = c.curriculum_modules.findIndex((m, mIdx) => 
-          String(m.id) === String(id) ||
-          `mod_${mIdx + 1}` === String(id) ||
-          (m.id && `mod_${m.id}` === String(id)) ||
-          (String(mIdx + 1) === String(id))
-        );
-        if (idx !== -1) {
-          targetCourse = c;
-          targetModuleIndex = idx;
-          if (!c.curriculum_modules[idx].id) {
-            c.curriculum_modules[idx].id = id;
-          }
-          break;
-        }
-      }
+    const targetCourseId = explicitCourseId || updateData?.course_id || updateData?.courseId;
+    if (!targetCourseId) {
+      throw { statusCode: 400, message: 'course_id is required to update a module.' };
     }
 
-    if (!targetCourse || targetModuleIndex === -1) {
-      throw { statusCode: 404, message: `Module '${id}' not found.` };
+    const targetCourse = (await courseService.getCourseById(targetCourseId, true).catch(() => null)) ||
+                         (await courseService.getCourseBySlug(targetCourseId, true).catch(() => null));
+    if (!targetCourse) {
+      throw { statusCode: 404, message: `Course '${targetCourseId}' not found.` };
+    }
+
+    if (!Array.isArray(targetCourse.curriculum_modules) || targetCourse.curriculum_modules.length === 0) {
+      throw { statusCode: 404, message: `Module '${id}' not found in course '${targetCourse.title}'.` };
+    }
+
+    const cleanTarget = String(id).trim().toLowerCase();
+    const targetModuleIndex = targetCourse.curriculum_modules.findIndex((m, mIdx) => {
+      if (!m) return false;
+      const mId = String(m.id || '').trim().toLowerCase();
+      if (mId === cleanTarget) return true;
+      if (`mod_${mIdx + 1}`.toLowerCase() === cleanTarget) return true;
+      if (String(mIdx + 1) === cleanTarget) return true;
+      if (m.id && `mod_${m.id}`.toLowerCase() === cleanTarget) return true;
+      return false;
+    });
+
+    if (targetModuleIndex === -1) {
+      throw { statusCode: 404, message: `Module '${id}' does not belong to course '${targetCourse.title}' (${targetCourse.id}).` };
+    }
+
+    if (!targetCourse.curriculum_modules[targetModuleIndex].id) {
+      targetCourse.curriculum_modules[targetModuleIndex].id = id;
     }
 
     const updatedModules = [...targetCourse.curriculum_modules];
@@ -301,6 +331,48 @@ class CurriculumService {
       ? `${durationMins / 60} hr${durationMins / 60 === 1 ? '' : 's'}`
       : `${(durationMins / 60).toFixed(1)} hrs`;
 
+    let cleanLessons = Array.isArray(updateData.lessons)
+      ? updateData.lessons
+      : (Array.isArray(updateData.topics) ? updateData.topics : (existingMod.lessons || []));
+
+    const isExplicitlyNoVideo = updateData.video_status === 'NO_VIDEO' || (updateData.video_url === '' && updateData.video_status !== 'READY');
+
+    let cleanTopics = Array.isArray(updateData.topics)
+      ? updateData.topics
+      : (existingMod.topics || existingMod.lessons || []);
+
+    if (isExplicitlyNoVideo && Array.isArray(cleanTopics)) {
+      cleanTopics = cleanTopics.map(t => {
+        if (typeof t === 'object' && t !== null) {
+          return {
+            ...t,
+            hls_master_url: null,
+            hls_prefix: null,
+            hls_720p_url: null,
+            hls_1080p_url: null,
+            processing_status: 'DRAFT'
+          };
+        }
+        return t;
+      });
+    }
+
+    // If video_url is explicitly updated or cleared, sync all child lesson objects
+    if (updateData.video_url !== undefined && Array.isArray(cleanLessons)) {
+      cleanLessons = cleanLessons.map(l => {
+        if (typeof l === 'object' && l !== null) {
+          return {
+            ...l,
+            video_url: updateData.video_url,
+            video_status: updateData.video_status || (updateData.video_url ? 'READY' : 'NO_VIDEO'),
+            video_asset_id: updateData.video_asset_id !== undefined ? updateData.video_asset_id : null,
+            video_error_message: updateData.video_error_message !== undefined ? updateData.video_error_message : ''
+          };
+        }
+        return l;
+      });
+    }
+
     const updatedMod = {
       ...existingMod,
       name: updateData.name || updateData.title || existingMod.name || existingMod.title,
@@ -309,14 +381,24 @@ class CurriculumService {
       duration_minutes: durationMins,
       duration: updateData.duration || durationHrsStr,
       duration_hours: Math.round((durationMins / 60) * 10) / 10,
-      video_url: updateData.video_url !== undefined ? updateData.video_url : (existingMod.video_url || ''),
-      video_status: updateData.video_status !== undefined ? updateData.video_status : (existingMod.video_status || (updateData.video_url || existingMod.video_url ? 'READY' : 'NO_VIDEO')),
+      video_url: updateData.video_url !== undefined ? updateData.video_url : (isExplicitlyNoVideo ? '' : (existingMod.video_url || '')),
+      video_status: updateData.video_status !== undefined ? updateData.video_status : (isExplicitlyNoVideo ? 'NO_VIDEO' : (existingMod.video_status || (existingMod.video_url ? 'READY' : 'NO_VIDEO'))),
       video_title: updateData.video_title !== undefined ? updateData.video_title : (existingMod.video_title || existingMod.title),
-      video_asset_id: updateData.video_asset_id !== undefined ? updateData.video_asset_id : (existingMod.video_asset_id || null),
-      video_error_message: updateData.video_error_message !== undefined ? updateData.video_error_message : (existingMod.video_error_message || ''),
-      topics: Array.isArray(updateData.topics) ? updateData.topics : (existingMod.topics || existingMod.lessons || []),
-      lessons: Array.isArray(updateData.lessons) ? updateData.lessons : (Array.isArray(updateData.topics) ? updateData.topics : existingMod.lessons || []),
-      is_preview: updateData.is_preview !== undefined ? Boolean(updateData.is_preview) : Boolean(existingMod.is_preview),
+      video_asset_id: isExplicitlyNoVideo ? null : (updateData.video_asset_id !== undefined ? updateData.video_asset_id : (existingMod.video_asset_id || null)),
+      video_error_message: isExplicitlyNoVideo ? '' : (updateData.video_error_message !== undefined ? updateData.video_error_message : (existingMod.video_error_message || '')),
+      hasVideo: !isExplicitlyNoVideo && Boolean(updateData.video_url || existingMod.video_url),
+      topics: cleanTopics,
+      lessons: cleanLessons,
+      is_preview: updateData.is_preview !== undefined
+        ? Boolean(updateData.is_preview)
+        : (updateData.is_free_preview !== undefined
+          ? Boolean(updateData.is_free_preview)
+          : Boolean(existingMod.is_preview || existingMod.is_free_preview)),
+      is_free_preview: updateData.is_free_preview !== undefined
+        ? Boolean(updateData.is_free_preview)
+        : (updateData.is_preview !== undefined
+          ? Boolean(updateData.is_preview)
+          : Boolean(existingMod.is_free_preview || existingMod.is_preview)),
       is_published: updateData.is_published !== undefined ? Boolean(updateData.is_published) : (existingMod.is_published !== undefined ? Boolean(existingMod.is_published) : true),
       updated_at: new Date().toISOString()
     };
@@ -332,6 +414,111 @@ class CurriculumService {
       .eq('id', targetCourse.id);
 
     if (updateErr) throw updateErr;
+
+    // ARCH-05: Synchronize relational module table if record exists
+    try {
+      if (updatedMod.id && /^[0-9a-f-]{36}$/i.test(String(updatedMod.id))) {
+        await supabase
+          .from('modules')
+          .update({
+            name: updatedMod.title || updatedMod.name,
+            description: updatedMod.description || '',
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', updatedMod.id);
+      }
+    } catch (syncRelErr) {
+      // Non-blocking sync note
+    }
+
+    // ARCH-06: Synchronize topics table in Supabase when topics are updated, renamed, or deleted
+    if (Array.isArray(cleanTopics)) {
+      try {
+        const modIdStr = String(updatedMod.id);
+        const modNumStr = String(targetModuleIndex + 1);
+
+        // Fetch only DB topics specifically belonging to this course and this module
+        let topicQuery = supabase
+          .from('topics')
+          .select('id, display_order, title')
+          .eq('course_id', targetCourse.id);
+
+        if (modIdStr === modNumStr) {
+          topicQuery = topicQuery.eq('module_id', modIdStr);
+        } else {
+          topicQuery = topicQuery.or(`module_id.eq.${modIdStr},module_id.eq.${modNumStr}`);
+        }
+
+        const { data: dbModTopics } = await topicQuery;
+
+        if (Array.isArray(dbModTopics) && dbModTopics.length > 0) {
+          const sortedDbModTopics = [...dbModTopics].sort((a, b) => (Number(a.display_order) || 0) - (Number(b.display_order) || 0));
+          const topicUpdatePromises = [];
+
+          for (let tIdx = 0; tIdx < cleanTopics.length; tIdx++) {
+            const t = cleanTopics[tIdx];
+            const title = typeof t === 'object' && t !== null ? (t.title || t.name) : String(t || '');
+            if (!title || !title.trim()) continue;
+            const cleanTitle = title.trim();
+
+            let targetDbTopic = null;
+            // 1. Match by UUID ID
+            if (typeof t === 'object' && t?.id) {
+              targetDbTopic = sortedDbModTopics.find(dbT => String(dbT.id) === String(t.id));
+            }
+            // 2. Match by display_order
+            if (!targetDbTopic && typeof t === 'object' && t?.display_order !== undefined) {
+              targetDbTopic = sortedDbModTopics.find(dbT => Number(dbT.display_order) === Number(t.display_order));
+            }
+            // 3. Match by index
+            if (!targetDbTopic && sortedDbModTopics[tIdx]) {
+              targetDbTopic = sortedDbModTopics[tIdx];
+            }
+
+            if (targetDbTopic && targetDbTopic.title !== cleanTitle) {
+              topicUpdatePromises.push(
+                supabase
+                  .from('topics')
+                  .update({
+                    title: cleanTitle,
+                    updated_at: new Date().toISOString()
+                  })
+                  .eq('id', targetDbTopic.id)
+              );
+            }
+          }
+
+          if (topicUpdatePromises.length > 0) {
+            await Promise.all(topicUpdatePromises);
+          }
+
+          // Clean up removed topics from DB if topics array shrank
+          if (cleanTopics.length < sortedDbModTopics.length) {
+            const remainingIds = new Set(
+              cleanTopics.map(t => (typeof t === 'object' && t !== null ? t.id : null)).filter(Boolean)
+            );
+            const deleteIds = [];
+            if (remainingIds.size > 0) {
+              for (const dbT of sortedDbModTopics) {
+                if (!remainingIds.has(dbT.id)) {
+                  deleteIds.push(dbT.id);
+                }
+              }
+            } else {
+              for (let i = cleanTopics.length; i < sortedDbModTopics.length; i++) {
+                deleteIds.push(sortedDbModTopics[i].id);
+              }
+            }
+            if (deleteIds.length > 0) {
+              await supabase.from('topics').delete().in('id', deleteIds);
+            }
+          }
+        }
+      } catch (topicSyncErr) {
+        console.warn('⚠️ [updateModule] Notice syncing topics table:', topicSyncErr.message);
+      }
+    }
+
     return updatedMod;
   }
 
@@ -350,27 +537,27 @@ class CurriculumService {
 
     console.log(`\n[MODULE DELETE AUDIT] Request - moduleId: '${id}', courseId: '${courseId || 'UNSPECIFIED'}'`);
 
-    let courses = [];
-    if (courseId) {
-      const { data: singleCourse } = await supabase
-        .from('courses')
-        .select('*')
-        .or(`id.eq.${courseId},slug.eq.${courseId}`)
-        .maybeSingle();
-
-      if (singleCourse) {
-        courses = [singleCourse];
-      }
+    if (!courseId) {
+      throw { statusCode: 400, message: 'course_id is required to delete a module. Global module deletion across courses is strictly prohibited.' };
     }
 
-    if (courses.length === 0) {
-      const { data: allCourses } = await supabase.from('courses').select('*');
-      courses = allCourses || [];
+    const cleanCourseId = String(courseId).trim();
+    const classification = classifyIdentifier(cleanCourseId);
+    if (classification === 'INVALID') {
+      throw { statusCode: 400, message: 'Invalid course identifier format.' };
     }
 
-    if (!courses || courses.length === 0) throw { statusCode: 404, message: 'Course not found.' };
+    let courseQuery = supabase.from('courses').select('*');
+    if (classification === 'UUID') {
+      courseQuery = courseQuery.eq('id', cleanCourseId);
+    } else {
+      courseQuery = courseQuery.eq('slug', normalizeIdentifier(cleanCourseId, 'SLUG'));
+    }
+    const { data: targetCourse, error: cErr } = await courseQuery.maybeSingle();
+    if (cErr || !targetCourse) {
+      throw { statusCode: 404, message: `Course not found for identifier '${courseId}'.` };
+    }
 
-    let targetCourse = null;
     let targetModuleIndex = -1;
 
     const matchesModule = (m, mIdx) => {
@@ -383,20 +570,17 @@ class CurriculumService {
 
       // 1. Explicit ID Matching (Exact UUID or string ID)
       if (m.id && String(m.id).trim().toLowerCase() === cleanTarget) {
-        if (/^[0-9]+$/.test(cleanTarget) && !courseId) return false;
         return true;
       }
       if (m.id && `mod_${m.id}`.toLowerCase() === cleanTarget) {
-        if (!courseId) return false;
         return true;
       }
       if (mId && mId === cleanTarget) {
-        if (/^[0-9]+$/.test(cleanTarget) && !courseId) return false;
         return true;
       }
 
       // 2. Fallback matching ONLY IF m.id is missing or undefined
-      if (!m.id && courseId) {
+      if (!m.id) {
         if (fallbackId === cleanTarget) return true;
         if (indexStr === cleanTarget) return true;
         if (mTitle && mTitle === cleanTarget) return true;
@@ -405,19 +589,15 @@ class CurriculumService {
       return false;
     };
 
-    for (const c of courses) {
-      if (Array.isArray(c.curriculum_modules)) {
-        const idx = c.curriculum_modules.findIndex((m, mIdx) => matchesModule(m, mIdx));
-        if (idx !== -1) {
-          targetCourse = c;
-          targetModuleIndex = idx;
-          break;
-        }
-      }
+    if (Array.isArray(targetCourse.curriculum_modules)) {
+      targetModuleIndex = targetCourse.curriculum_modules.findIndex((m, mIdx) => matchesModule(m, mIdx));
     }
 
-    if (!targetCourse || targetModuleIndex === -1) {
-      throw { statusCode: 404, message: `Module '${id}' not found.` };
+    if (targetModuleIndex === -1) {
+      throw {
+        statusCode: 404,
+        message: `Module '${id}' does not belong to course '${targetCourse.title}' (${targetCourse.id}). Module deletion rejected.`
+      };
     }
 
     const targetModule = targetCourse.curriculum_modules[targetModuleIndex];
@@ -459,6 +639,45 @@ class CurriculumService {
       .eq('id', targetCourse.id);
 
     if (updateErr) throw updateErr;
+
+    // ARCH-06: Scoped cleanup of orphaned relational records (modules/lessons/lesson_topics) if present
+    try {
+      const { data: cVersions } = await supabase
+        .from('course_versions')
+        .select('id')
+        .eq('course_id', targetCourse.id);
+
+      if (cVersions && cVersions.length > 0) {
+        const vIds = cVersions.map(v => v.id);
+        const { data: relMods } = await supabase
+          .from('modules')
+          .select('id, name')
+          .in('course_version_id', vIds);
+
+        if (relMods && relMods.length > 0) {
+          const modToDelete = relMods.find(rm =>
+            rm.id === id ||
+            (targetModule.id && rm.id === targetModule.id) ||
+            rm.name === (targetModule.title || targetModule.name)
+          );
+          if (modToDelete) {
+            const { data: relLessons } = await supabase
+              .from('lessons')
+              .select('id')
+              .eq('module_id', modToDelete.id);
+
+            if (relLessons && relLessons.length > 0) {
+              const lIds = relLessons.map(l => l.id);
+              await supabase.from('lesson_topics').delete().in('lesson_id', lIds);
+              await supabase.from('lessons').delete().eq('module_id', modToDelete.id);
+            }
+            await supabase.from('modules').delete().eq('id', modToDelete.id);
+          }
+        }
+      }
+    } catch (relCleanupErr) {
+      console.warn('[CURRICULUM ARCH-06] Relational module cleanup note:', relCleanupErr.message);
+    }
 
     try {
       const courseService = require('../courses/course.service');
@@ -817,6 +1036,51 @@ class CurriculumService {
       throw { statusCode: 400, message: 'Topic ID is required.' };
     }
 
+    const newTitle = (updateData?.title || updateData?.name || '').trim();
+
+    // 1. Direct check in public.topics table (MediaConvert / Video Splitter topics)
+    try {
+      const { data: dbTopic } = await supabase.from('topics').select('*').eq('id', id).maybeSingle();
+      if (dbTopic) {
+        if (newTitle) {
+          await supabase
+            .from('topics')
+            .update({ title: newTitle, updated_at: new Date().toISOString() })
+            .eq('id', id);
+        }
+
+        // Also update in courses table curriculum_modules if course_id is known
+        if (dbTopic.course_id) {
+          const { data: c } = await supabase.from('courses').select('id, curriculum_modules').eq('id', dbTopic.course_id).maybeSingle();
+          if (c && Array.isArray(c.curriculum_modules)) {
+            let modUpdated = false;
+            const updatedMods = c.curriculum_modules.map((m, mIdx) => {
+              const modIdStr = String(m.id || mIdx + 1);
+              if (String(dbTopic.module_id) === modIdStr || String(dbTopic.module_id) === String(mIdx + 1)) {
+                if (Array.isArray(m.topics)) {
+                  m.topics = m.topics.map(t => {
+                    if (typeof t === 'object' && t !== null && (String(t.id) === String(id) || Number(t.display_order) === Number(dbTopic.display_order))) {
+                      modUpdated = true;
+                      return { ...t, title: newTitle, name: newTitle };
+                    }
+                    return t;
+                  });
+                }
+              }
+              return m;
+            });
+            if (modUpdated) {
+              await supabase.from('courses').update({ curriculum_modules: updatedMods, updated_at: new Date().toISOString() }).eq('id', c.id);
+            }
+          }
+        }
+        return { ...dbTopic, title: newTitle, name: newTitle };
+      }
+    } catch (dbErr) {
+      console.warn('⚠️ [updateTopic] Direct topics table lookup note:', dbErr.message);
+    }
+
+    // 2. Search in course versions and curriculum_modules
     const { data: courses } = await supabase.from('courses').select('*');
     if (!courses) throw { statusCode: 404, message: 'Course not found.' };
 
@@ -824,11 +1088,32 @@ class CurriculumService {
     let targetModuleIndex = -1;
     let targetLessonIndex = -1;
     let targetTopicIndex = -1;
+    let isModuleLevelTopic = false;
 
     for (const c of courses) {
       if (Array.isArray(c.curriculum_modules)) {
         for (let mIdx = 0; mIdx < c.curriculum_modules.length; mIdx++) {
           const mod = c.curriculum_modules[mIdx];
+
+          // Check module-level topics
+          if (Array.isArray(mod.topics)) {
+            const tIdx = mod.topics.findIndex((t, idx) => {
+              if (typeof t === 'object' && t !== null) {
+                return String(t.id) === String(id) || String(t.title) === String(id) || `top_${idx + 1}` === String(id);
+              }
+              return String(t) === String(id) || `top_${idx + 1}` === String(id);
+            });
+
+            if (tIdx !== -1) {
+              targetCourse = c;
+              targetModuleIndex = mIdx;
+              targetTopicIndex = tIdx;
+              isModuleLevelTopic = true;
+              break;
+            }
+          }
+
+          // Check lesson-level topics
           if (Array.isArray(mod.lessons)) {
             for (let lIdx = 0; lIdx < mod.lessons.length; lIdx++) {
               const les = mod.lessons[lIdx];
@@ -864,25 +1149,38 @@ class CurriculumService {
       }
     }
 
-    if (!targetCourse || targetModuleIndex === -1 || targetLessonIndex === -1 || targetTopicIndex === -1) {
+    if (!targetCourse || targetModuleIndex === -1 || targetTopicIndex === -1) {
       throw { statusCode: 404, message: `Topic '${id}' not found.` };
     }
 
     const updatedModules = [...targetCourse.curriculum_modules];
     const targetModule = { ...updatedModules[targetModuleIndex] };
-    const targetLessons = [...targetModule.lessons];
-    const targetLesson = { ...targetLessons[targetLessonIndex] };
-    const updatedTopics = [...targetLesson.topics];
+    let updatedTopic = null;
 
-    const updatedTopic = {
-      ...updatedTopics[targetTopicIndex],
-      title: updateData.title !== undefined ? updateData.title.trim() : updatedTopics[targetTopicIndex].title
-    };
+    if (isModuleLevelTopic) {
+      const rawTopics = [...targetModule.topics];
+      const existing = rawTopics[targetTopicIndex];
+      updatedTopic = typeof existing === 'object' && existing !== null
+        ? { ...existing, title: newTitle || existing.title, name: newTitle || existing.name }
+        : newTitle;
+      rawTopics[targetTopicIndex] = updatedTopic;
+      targetModule.topics = rawTopics;
+    } else {
+      const targetLessons = [...targetModule.lessons];
+      const targetLesson = { ...targetLessons[targetLessonIndex] };
+      const updatedTopics = [...targetLesson.topics];
 
-    updatedTopics[targetTopicIndex] = updatedTopic;
-    targetLesson.topics = updatedTopics;
-    targetLessons[targetLessonIndex] = targetLesson;
-    targetModule.lessons = targetLessons;
+      updatedTopic = {
+        ...updatedTopics[targetTopicIndex],
+        title: newTitle || updatedTopics[targetTopicIndex].title
+      };
+
+      updatedTopics[targetTopicIndex] = updatedTopic;
+      targetLesson.topics = updatedTopics;
+      targetLessons[targetLessonIndex] = targetLesson;
+      targetModule.lessons = targetLessons;
+    }
+
     updatedModules[targetModuleIndex] = targetModule;
 
     const { error: updateErr } = await supabase
@@ -894,6 +1192,22 @@ class CurriculumService {
       .eq('id', targetCourse.id);
 
     if (updateErr) throw updateErr;
+
+    // Synchronize topics table directly if topic id exists
+    try {
+      if (id && newTitle) {
+        await supabase
+          .from('topics')
+          .update({
+            title: newTitle,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', id);
+      }
+    } catch (e) {
+      // ignore
+    }
+
     return updatedTopic;
   }
 
@@ -948,7 +1262,17 @@ class CurriculumService {
     }
 
     if (!targetCourse || targetModuleIndex === -1 || targetLessonIndex === -1) {
-      throw { statusCode: 404, message: `Topic '${id}' not found.` };
+      // Check if this topic exists in public.topics table or public.topic_videos
+      try {
+        const { data: dbTopic } = await supabase.from('topics').select('id').eq('id', id).maybeSingle();
+        if (dbTopic) {
+          await supabase.from('topics').delete().eq('id', id);
+          return { success: true, message: `Topic '${id}' deleted successfully from database.` };
+        }
+      } catch (dbErr) {
+        // ignore
+      }
+      return { success: true, message: `Topic '${id}' deleted or already removed.` };
     }
 
     const { error: updateErr } = await supabase
@@ -987,13 +1311,83 @@ class CurriculumService {
       throw { statusCode: 404, message: 'Course not found or not published.' };
     }
 
+    // Fetch real uploaded videos and topics for this course to enrich curriculum telemetry
+    let dbLessonVideos = [];
+    let dbTopics = [];
+    try {
+      const [vRes, tRes] = await Promise.all([
+        supabase.from('lesson_videos').select('id, lesson_id, module_id, status, hls_master_url, duration_seconds').eq('course_id', course.id),
+        supabase.from('topics').select('id, module_id, title, duration_seconds, display_order, start_time_seconds, end_time_seconds, start_timecode, end_timecode, processing_status, hls_master_url, source_video_id').eq('course_id', course.id).order('display_order', { ascending: true })
+      ]);
+      dbLessonVideos = vRes.data || [];
+      dbTopics = tRes.data || [];
+    } catch (dbErr) {
+      console.warn('⚠️ [Curriculum Read] Notice fetching DB video telemetry:', dbErr.message);
+    }
+
+    const sortModuleFn = (a, b) => {
+      const titleA = String(a.title || a.name || '');
+      const titleB = String(b.title || b.name || '');
+      const numMatchA = titleA.match(/(?:module|mod|m)\s*(\d+)/i) || titleA.match(/^\s*(\d+)/);
+      const numMatchB = titleB.match(/(?:module|mod|m)\s*(\d+)/i) || titleB.match(/^\s*(\d+)/);
+      const numA = numMatchA ? parseInt(numMatchA[1] || numMatchA[0], 10) : null;
+      const numB = numMatchB ? parseInt(numMatchB[1] || numMatchB[0], 10) : null;
+      if (numA !== null && numB !== null && numA !== numB) return numA - numB;
+      const orderA = a.display_order !== undefined && a.display_order !== null ? Number(a.display_order) : 999;
+      const orderB = b.display_order !== undefined && b.display_order !== null ? Number(b.display_order) : 999;
+      if (orderA !== orderB) return orderA - orderB;
+      return titleA.localeCompare(titleB, undefined, { numeric: true, sensitivity: 'base' });
+    };
+
     // Helper to format JSON curriculum_modules if present
     const formatJsonCurriculum = (jsonModules) => {
-      return (jsonModules || []).map((m, idx) => {
-        const rawLessons = Array.isArray(m.lessons) ? m.lessons : [];
-        const durationMins = Number(m.duration_minutes) || (parseFloat(m.duration) ? Math.round(parseFloat(m.duration) * 60) : 60);
+      const sortedJsonModules = [...(jsonModules || [])].sort(sortModuleFn);
+      return sortedJsonModules.map((m, idx) => {
+        const modIdStr = String(m.id || idx + 1);
+        const modNumStr = String(idx + 1);
+
+        const matchedVideos = (dbLessonVideos || []).filter(v => 
+          String(v.module_id) === modIdStr || String(v.module_id) === modNumStr || String(v.lesson_id) === modIdStr
+        );
+        const readyVideo = matchedVideos.find(v => 
+          v.status === 'READY' && v.hls_master_url && v.status !== 'FAILED' && v.status !== 'DELETED' && v.status !== 'DELETING' && v.status !== 'UNASSIGNED'
+        );
+        const uploadedVideo = matchedVideos.find(v => v.status === 'UPLOADED' || v.status === 'SEGMENTATION_REQUIRED' || v.status === 'SEGMENTATION_CONFIRMED');
+        const processingVideo = matchedVideos.find(v => v.status === 'PROCESSING' || v.status === 'UPLOADING' || v.status === 'TRANSCODING');
+
+        const hasDbVideo = Boolean(readyVideo || uploadedVideo || processingVideo);
+        const isExplicitlyNoVideo = !hasDbVideo && (
+          m.video_status === 'NO_VIDEO' || 
+          m.video_status === 'UNASSIGNED' || 
+          (m.hasVideo === false && !m.video_url && !m.video_asset_id)
+        );
+
+        const matchedTopics = isExplicitlyNoVideo ? [] : (dbTopics || []).filter(t => 
+          String(t.module_id) === modIdStr || String(t.module_id) === modNumStr
+        );
+        const readyTopicsWithHls = isExplicitlyNoVideo ? [] : matchedTopics.filter(t => 
+          t.processing_status === 'READY' && t.hls_master_url
+        );
+        const hasRealTopicHls = !isExplicitlyNoVideo && (readyTopicsWithHls.length > 0 || (Array.isArray(m.topics) && m.topics.some(t => Boolean(t?.hls_master_url && t?.processing_status === 'READY'))));
+
+        const effectiveHlsUrl = isExplicitlyNoVideo ? '' : (readyVideo?.hls_master_url || readyTopicsWithHls[0]?.hls_master_url || m.video_url || '');
+        const effectiveAssetId = isExplicitlyNoVideo ? null : (readyVideo?.id || uploadedVideo?.id || readyTopicsWithHls[0]?.source_video_id || m.video_asset_id || null);
+
+        // If topics have real duration seconds, calculate total runtime
+        const totalTopicSecs = readyTopicsWithHls.reduce((sum, t) => sum + (Number(t.duration_seconds) || 0), 0);
+        let durationMins = totalTopicSecs > 0
+          ? Math.round(totalTopicSecs / 60)
+          : (Number(m.duration_minutes) || (parseFloat(m.duration) ? Math.round(parseFloat(m.duration) * 60) : 60));
+
         const durationHrsStr = (durationMins / 60) % 1 === 0 ? `${durationMins / 60} hr${durationMins / 60 === 1 ? '' : 's'}` : `${(durationMins / 60).toFixed(1)} hrs`;
 
+        const hasVideoAvailable = !isExplicitlyNoVideo && (Boolean(effectiveHlsUrl && effectiveHlsUrl.trim() !== '') || hasRealTopicHls || Boolean(readyVideo) || Boolean(uploadedVideo));
+
+        const videoStatus = isExplicitlyNoVideo
+          ? 'NO_VIDEO'
+          : (readyVideo ? 'READY' : (uploadedVideo ? uploadedVideo.status : (processingVideo ? processingVideo.status : (hasVideoAvailable ? 'READY' : (m.video_status || 'NO_VIDEO')))));
+
+        const rawLessons = Array.isArray(m.lessons) ? m.lessons : [];
         const formattedLessons = rawLessons.map((l, lIdx) => {
           if (typeof l === 'object' && l !== null) {
             const rawTopics = Array.isArray(l.topics) ? l.topics : [];
@@ -1001,7 +1395,10 @@ class CurriculumService {
               if (typeof t === 'object' && t !== null) {
                 return {
                   id: t.id || `top_${l.id || lIdx + 1}_${tIdx + 1}`,
-                  title: t.title || t.name || String(t)
+                  title: t.title || t.name || String(t),
+                  hls_master_url: isExplicitlyNoVideo ? null : (t.hls_master_url || null),
+                  processing_status: isExplicitlyNoVideo ? 'DRAFT' : (t.processing_status || null),
+                  duration_seconds: isExplicitlyNoVideo ? 0 : (t.duration_seconds || 0)
                 };
               }
               return {
@@ -1016,11 +1413,13 @@ class CurriculumService {
               title: l.title || l.name || `Lesson ${lIdx + 1}`,
               description: l.description || '',
               lesson_type: (l.lesson_type || 'VIDEO').toUpperCase(),
-              duration_minutes: Number(l.duration_minutes) || 30,
-              duration: l.duration || `${Number(l.duration_minutes) || 30} mins`,
-              video_url: l.video_url || '',
+              duration_minutes: Number(l.duration_minutes) || 14,
+              duration: l.duration || `${Number(l.duration_minutes) || 14} mins`,
+              video_url: isExplicitlyNoVideo ? '' : (l.video_url || effectiveHlsUrl),
+              video_status: isExplicitlyNoVideo ? 'NO_VIDEO' : (l.video_status || videoStatus),
               thumbnail_url: l.thumbnail_url || course.thumbnail_url || '',
-              is_preview: Boolean(l.is_preview),
+              is_preview: Boolean(l.is_preview || l.is_free_preview),
+              is_free_preview: Boolean(l.is_preview || l.is_free_preview),
               topics: formattedTopics
             };
           }
@@ -1033,17 +1432,181 @@ class CurriculumService {
             lesson_type: 'VIDEO',
             duration_minutes: Math.round(durationMins / (rawLessons.length || 1)),
             duration: `${Math.round(durationMins / (rawLessons.length || 1))} mins`,
-            video_url: '',
+            video_url: isExplicitlyNoVideo ? '' : effectiveHlsUrl,
+            video_status: isExplicitlyNoVideo ? 'NO_VIDEO' : videoStatus,
             thumbnail_url: course.thumbnail_url || '',
             is_preview: idx === 0 && lIdx === 0,
             topics: []
           };
         });
 
-        const videoCount = formattedLessons.filter(l => l.lesson_type === 'VIDEO').length;
+        // Merge topic objects with real HLS URLs and status from DB
+        const sortTopicFn = (a, b) => {
+          const titleA = typeof a === 'object' && a !== null ? (a.title || a.name || '') : String(a || '');
+          const titleB = typeof b === 'object' && b !== null ? (b.title || b.name || '') : String(b || '');
+          const numMatchA = titleA.match(/(?:topic|lesson|chapter|part)\s*(\d+)/i) || titleA.match(/^\s*(\d+)/);
+          const numMatchB = titleB.match(/(?:topic|lesson|chapter|part)\s*(\d+)/i) || titleB.match(/^\s*(\d+)/);
+          const numA = numMatchA ? parseInt(numMatchA[1] || numMatchA[0], 10) : null;
+          const numB = numMatchB ? parseInt(numMatchB[1] || numMatchB[0], 10) : null;
+          if (numA !== null && numB !== null && numA !== numB) return numA - numB;
+          const timeA = typeof a?.start_time_seconds === 'number' ? a.start_time_seconds : null;
+          const timeB = typeof b?.start_time_seconds === 'number' ? b.start_time_seconds : null;
+          if (timeA !== null && timeB !== null && timeA !== timeB && timeA > 0 && timeB > 0) return timeA - timeB;
+          const orderA = a.display_order !== undefined && a.display_order !== null ? Number(a.display_order) : 999;
+          const orderB = b.display_order !== undefined && b.display_order !== null ? Number(b.display_order) : 999;
+          if (orderA !== orderB) return orderA - orderB;
+          return titleA.localeCompare(titleB, undefined, { numeric: true, sensitivity: 'base' });
+        };
+
+        let mergedTopics = [];
+        const baseCurriculumTopics = (Array.isArray(m.topics) && m.topics.length > 0)
+          ? m.topics
+          : ((Array.isArray(m.lessons) && m.lessons.length > 0) ? m.lessons : []);
+
+        if (baseCurriculumTopics.length > 0) {
+          const matchedDbTopicIds = new Set();
+          const sortedDbTopics = !isExplicitlyNoVideo && matchedTopics.length > 0
+            ? [...matchedTopics].sort(sortTopicFn)
+            : [];
+
+          mergedTopics = baseCurriculumTopics.map((t, tIdx) => {
+            const isObj = typeof t === 'object' && t !== null;
+            const tId = isObj ? t.id : null;
+            const tOrder = isObj && t.display_order !== undefined ? Number(t.display_order) : (tIdx + 1);
+            const tTitle = isObj ? (t.title || t.name || `Topic ${tIdx + 1}`) : String(t || `Topic ${tIdx + 1}`);
+
+            // Find matching DB topic if available
+            let mt = null;
+            if (sortedDbTopics.length > 0) {
+              if (tId) {
+                mt = sortedDbTopics.find(d => String(d.id) === String(tId));
+              }
+              if (!mt && tOrder !== undefined) {
+                mt = sortedDbTopics.find(d => Number(d.display_order) === tOrder);
+              }
+              if (!mt && tTitle) {
+                mt = sortedDbTopics.find(d => {
+                  const dTitle = (d.title || '').trim().toLowerCase();
+                  return dTitle && dTitle === tTitle.trim().toLowerCase();
+                });
+              }
+              if (!mt && tIdx < sortedDbTopics.length && !matchedDbTopicIds.has(sortedDbTopics[tIdx]?.id)) {
+                const candidate = sortedDbTopics[tIdx];
+                if (candidate && (!candidate.display_order || Number(candidate.display_order) === tOrder)) {
+                  mt = candidate;
+                }
+              }
+            }
+
+            if (mt) {
+              matchedDbTopicIds.add(mt.id);
+            }
+
+            const effectiveTitle = tTitle || (mt ? mt.title : `Topic ${tIdx + 1}`);
+            const durSec = (isExplicitlyNoVideo ? 0 : (mt?.duration_seconds || (isObj ? t.duration_seconds : 0))) || 855;
+            const durMins = Math.round(durSec / 60);
+            const formattedDur = durSec > 0 
+              ? (durSec >= 60 ? (durMins >= 60 ? `${Math.floor(durMins / 60)} hr ${durMins % 60 ? `${durMins % 60} min` : ''}`.trim() : `${durMins} mins`) : `${durSec}s`) 
+              : (isObj && t.duration ? t.duration : `${durMins || 14} mins`);
+
+            const isTopicPreview = Boolean(
+              (isObj && (t.is_preview || t.is_free_preview)) ||
+              mt?.is_preview ||
+              mt?.is_free_preview
+            );
+
+            return {
+              id: tId || mt?.id || `top_${modIdStr}_${tIdx + 1}`,
+              title: effectiveTitle,
+              name: effectiveTitle,
+              display_order: tOrder,
+              start_time_seconds: isExplicitlyNoVideo ? 0 : (mt?.start_time_seconds ?? (isObj ? (t.start_time_seconds || 0) : 0)),
+              end_time_seconds: isExplicitlyNoVideo ? 0 : (mt?.end_time_seconds ?? (isObj ? (t.end_time_seconds || 0) : 0)),
+              start_timecode: isExplicitlyNoVideo ? '' : (mt?.start_timecode || (isObj ? (t.start_timecode || '') : '')),
+              end_timecode: isExplicitlyNoVideo ? '' : (mt?.end_timecode || (isObj ? (t.end_timecode || '') : '')),
+              duration_seconds: isExplicitlyNoVideo ? 0 : durSec,
+              duration: isExplicitlyNoVideo ? '0s' : formattedDur,
+              duration_minutes: isExplicitlyNoVideo ? 0 : (durMins || 14),
+              processing_status: isExplicitlyNoVideo ? 'DRAFT' : (mt?.processing_status || (isObj ? t.processing_status : null) || 'DRAFT'),
+              hls_master_url: isExplicitlyNoVideo ? null : (mt?.hls_master_url || (isObj ? t.hls_master_url : null) || null),
+              is_preview: isTopicPreview,
+              is_free_preview: isTopicPreview
+            };
+          });
+
+          // Append any DB topics that weren't in base curriculum
+          if (sortedDbTopics.length > 0) {
+            for (let dbIdx = 0; dbIdx < sortedDbTopics.length; dbIdx++) {
+              const mt = sortedDbTopics[dbIdx];
+              if (mt && mt.id && !matchedDbTopicIds.has(mt.id)) {
+                const durSec = mt.duration_seconds || 0;
+                const durMins = Math.round(durSec / 60);
+                const formattedDur = durSec > 0 
+                  ? (durSec >= 60 ? (durMins >= 60 ? `${Math.floor(durMins / 60)} hr ${durMins % 60 ? `${durMins % 60} min` : ''}`.trim() : `${durMins} mins`) : `${durSec}s`) 
+                  : '14 mins';
+                const isTopicPreview = Boolean(mt.is_preview || mt.is_free_preview);
+
+                mergedTopics.push({
+                  id: mt.id || `top_${modIdStr}_db_${dbIdx + 1}`,
+                  title: mt.title || `Topic ${mergedTopics.length + 1}`,
+                  name: mt.title || `Topic ${mergedTopics.length + 1}`,
+                  display_order: mt.display_order !== undefined ? mt.display_order : (mergedTopics.length + 1),
+                  start_time_seconds: isExplicitlyNoVideo ? 0 : (mt.start_time_seconds || 0),
+                  end_time_seconds: isExplicitlyNoVideo ? 0 : (mt.end_time_seconds || 0),
+                  start_timecode: isExplicitlyNoVideo ? '' : (mt.start_timecode || ''),
+                  end_timecode: isExplicitlyNoVideo ? '' : (mt.end_timecode || ''),
+                  duration_seconds: isExplicitlyNoVideo ? 0 : durSec,
+                  duration: isExplicitlyNoVideo ? '0s' : formattedDur,
+                  duration_minutes: isExplicitlyNoVideo ? 0 : (durMins || 14),
+                  processing_status: isExplicitlyNoVideo ? 'DRAFT' : (mt.processing_status || 'DRAFT'),
+                  hls_master_url: isExplicitlyNoVideo ? null : (mt.hls_master_url || null),
+                  is_preview: isTopicPreview,
+                  is_free_preview: isTopicPreview
+                });
+              }
+            }
+          }
+        } else if (!isExplicitlyNoVideo && matchedTopics.length > 0) {
+          const sortedDbTopics = [...matchedTopics].sort(sortTopicFn);
+          mergedTopics = sortedDbTopics.map((mt, mtIdx) => {
+            const durSec = mt.duration_seconds || 0;
+            const durMins = Math.round(durSec / 60);
+            const formattedDur = durSec > 0 
+              ? (durSec >= 60 ? (durMins >= 60 ? `${Math.floor(durMins / 60)} hr ${durMins % 60 ? `${durMins % 60} min` : ''}`.trim() : `${durMins} mins`) : `${durSec}s`) 
+              : '14 mins';
+            const isTopicPreview = Boolean(mt.is_preview || mt.is_free_preview);
+
+            return {
+              id: mt.id || `top_${modIdStr}_${mtIdx + 1}`,
+              title: mt.title || `Topic ${mtIdx + 1}`,
+              name: mt.title || `Topic ${mtIdx + 1}`,
+              display_order: mt.display_order !== undefined ? mt.display_order : mtIdx + 1,
+              start_time_seconds: mt.start_time_seconds || 0,
+              end_time_seconds: mt.end_time_seconds || 0,
+              start_timecode: mt.start_timecode || '',
+              end_timecode: mt.end_timecode || '',
+              duration_seconds: durSec,
+              duration: formattedDur,
+              duration_minutes: durMins || 14,
+              processing_status: mt.processing_status || 'DRAFT',
+              hls_master_url: mt.hls_master_url || null,
+              is_preview: isTopicPreview,
+              is_free_preview: isTopicPreview
+            };
+          });
+        } else {
+          mergedTopics = formattedLessons.map((l, lIdx) => ({ id: l.id, title: l.title, display_order: lIdx + 1 }));
+        }
+        mergedTopics.sort(sortTopicFn);
+
+        const videoCount = isExplicitlyNoVideo ? 0 : (formattedLessons.filter(l => l.lesson_type === 'VIDEO' && l.video_url).length || (hasVideoAvailable ? 1 : 0));
 
         return {
           id: m.id || `mod_${idx + 1}`,
+          course_id: course.id,
+          courseId: course.id,
+          course_slug: course.slug,
+          courseSlug: course.slug,
           name: m.title || m.name || `Module ${idx + 1}`,
           title: m.title || m.name || `Module ${idx + 1}`,
           description: m.description || `Module ${idx + 1} of ${course.title}`,
@@ -1051,13 +1614,16 @@ class CurriculumService {
           duration: m.duration || durationHrsStr,
           duration_minutes: durationMins,
           duration_hours: m.duration_hours || Math.round((durationMins / 60) * 10) / 10,
-          video_url: m.video_url || formattedLessons[0]?.video_url || '',
-          video_status: m.video_status || (m.video_url || formattedLessons[0]?.video_url ? 'READY' : 'NO_VIDEO'),
+          video_url: isExplicitlyNoVideo ? '' : effectiveHlsUrl,
+          video_status: isExplicitlyNoVideo ? 'NO_VIDEO' : videoStatus,
+          hasVideo: !isExplicitlyNoVideo && hasVideoAvailable,
           video_title: m.video_title || m.title || m.name,
-          video_asset_id: m.video_asset_id || null,
-          video_error_message: m.video_error_message || '',
-          topics: Array.isArray(m.topics) ? m.topics : formattedLessons.map(l => ({ id: l.id, title: l.title })),
+          video_asset_id: isExplicitlyNoVideo ? null : effectiveAssetId,
+          video_error_message: isExplicitlyNoVideo ? '' : (m.video_error_message || ''),
+          topics: mergedTopics,
           videos: videoCount,
+          is_preview: Boolean(m.is_preview || m.is_free_preview),
+          is_free_preview: Boolean(m.is_preview || m.is_free_preview),
           lessons: formattedLessons
         };
       });
@@ -1110,7 +1676,7 @@ class CurriculumService {
           };
         });
 
-        formattedModules = await Promise.all(modulePromises);
+        formattedModules = (await Promise.all(modulePromises)).sort(sortModuleFn);
       }
     }
 

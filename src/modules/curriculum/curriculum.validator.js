@@ -118,7 +118,27 @@ function sanitizeLessonsArray(rawLessons) {
  */
 function validateCreateModule(req) {
   const { versionId } = req.params;
-  const { name, title, slug, description, display_order, status, lessons, duration, duration_minutes, duration_hours } = req.body || {};
+  const {
+    name,
+    title,
+    slug,
+    description,
+    display_order,
+    status,
+    lessons,
+    topics,
+    duration,
+    duration_minutes,
+    duration_hours,
+    video_url,
+    video_status,
+    video_title,
+    video_asset_id,
+    video_error_message,
+    is_preview,
+    is_free_preview,
+    is_published
+  } = req.body || {};
 
   if (!versionId || !isValidUUID(versionId)) {
     return { isValid: false, error: 'Valid versionId UUID is required.' };
@@ -144,6 +164,8 @@ function validateCreateModule(req) {
     return { isValid: false, error: `Invalid module status. Allowed: ${ALLOWED_MODULE_STATUSES.join(', ')}` };
   }
 
+  const effectivePreview = is_preview !== undefined ? is_preview : is_free_preview;
+
   return {
     isValid: true,
     sanitizedData: {
@@ -156,14 +178,42 @@ function validateCreateModule(req) {
       duration_minutes: duration_minutes !== undefined ? Number(duration_minutes) : (duration_hours ? Math.round(Number(duration_hours) * 60) : undefined),
       display_order: display_order !== undefined && display_order !== null ? Number(display_order) : 0,
       status: status ? status.toUpperCase() : 'PUBLISHED',
-      lessons: Array.isArray(lessons) ? sanitizeLessonsArray(lessons) : undefined
+      lessons: Array.isArray(lessons) ? sanitizeLessonsArray(lessons) : undefined,
+      topics: Array.isArray(topics) ? topics : undefined,
+      video_url: video_url !== undefined ? String(video_url).trim() : undefined,
+      video_status: video_status !== undefined ? String(video_status).trim().toUpperCase() : undefined,
+      video_title: video_title !== undefined ? String(video_title).trim() : undefined,
+      video_asset_id: video_asset_id !== undefined ? video_asset_id : undefined,
+      video_error_message: video_error_message !== undefined ? String(video_error_message).trim() : undefined,
+      is_preview: effectivePreview !== undefined ? Boolean(effectivePreview) : undefined,
+      is_published: is_published !== undefined ? Boolean(is_published) : undefined
     }
   };
 }
 
 function validateUpdateModule(req) {
   const { id } = req.params;
-  const { name, title, slug, description, display_order, status, lessons, duration, duration_minutes, duration_hours } = req.body || {};
+  const {
+    name,
+    title,
+    slug,
+    description,
+    display_order,
+    status,
+    lessons,
+    topics,
+    duration,
+    duration_minutes,
+    duration_hours,
+    video_url,
+    video_status,
+    video_title,
+    video_asset_id,
+    video_error_message,
+    is_preview,
+    is_free_preview,
+    is_published
+  } = req.body || {};
 
   if (!id || typeof id !== 'string' || id.trim().length === 0) {
     return { isValid: false, error: 'Valid Module ID is required.' };
@@ -202,6 +252,23 @@ function validateUpdateModule(req) {
   if (display_order !== undefined) sanitizedData.display_order = Number(display_order);
   if (status !== undefined) sanitizedData.status = status.toUpperCase();
   if (Array.isArray(lessons)) sanitizedData.lessons = sanitizeLessonsArray(lessons);
+  if (Array.isArray(topics)) sanitizedData.topics = topics;
+
+  // Video fields (critical for Add, Update, Replace, and Remove Video operations)
+  if (video_url !== undefined) sanitizedData.video_url = String(video_url).trim();
+  if (video_status !== undefined) sanitizedData.video_status = String(video_status).trim().toUpperCase();
+  if (video_title !== undefined) sanitizedData.video_title = String(video_title).trim();
+  if (video_asset_id !== undefined) sanitizedData.video_asset_id = video_asset_id;
+  if (video_error_message !== undefined) sanitizedData.video_error_message = String(video_error_message).trim();
+  const effectiveUpdatePreview = is_preview !== undefined ? is_preview : is_free_preview;
+  if (effectiveUpdatePreview !== undefined) sanitizedData.is_preview = Boolean(effectiveUpdatePreview);
+  if (is_published !== undefined) sanitizedData.is_published = Boolean(is_published);
+
+  // Preserve course_id if passed in body or query
+  const effectiveCourseId = req.body?.course_id || req.body?.courseId || req.query?.courseId || req.query?.course_id;
+  if (effectiveCourseId !== undefined && effectiveCourseId !== null && String(effectiveCourseId).trim()) {
+    sanitizedData.course_id = String(effectiveCourseId).trim();
+  }
 
   return { isValid: true, sanitizedData };
 }

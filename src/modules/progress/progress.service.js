@@ -4,12 +4,45 @@
  */
 
 const { supabase } = require('../../config/supabase');
+const { classifyIdentifier, normalizeIdentifier } = require('../../utils/idValidator');
 
 // Resilient memory cache for offline/local development
 const memoryProgressStore = new Map();
 const memoryCertificateRequests = new Map();
 
 class ProgressService {
+  /**
+   * Helper to resolve course by UUID or slug with strict identifier validation
+   */
+  async findCourse(courseIdOrSlug) {
+    if (!courseIdOrSlug) return null;
+    const classification = classifyIdentifier(courseIdOrSlug);
+
+    // If identifier is invalid (injection syntax, dangerous characters, whitespace), reject immediately without querying DB
+    if (classification === 'INVALID') {
+      return null;
+    }
+    const clean = String(courseIdOrSlug).trim();
+
+    let query = supabase.from('courses').select('id, title, slug, curriculum_modules');
+    if (classification === 'UUID') {
+      query = query.eq('id', clean);
+    } else {
+      query = query.eq('slug', normalizeIdentifier(clean, 'SLUG'));
+    }
+
+    let { data: course } = await query.maybeSingle();
+    if (!course && classification === 'SLUG') {
+      const { data: allCourses } = await supabase.from('courses').select('id, title, slug, curriculum_modules');
+      course = (allCourses || []).find(c => 
+        c.slug === clean || 
+        c.slug?.toLowerCase() === clean.toLowerCase() ||
+        (c.title && c.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '') === clean.toLowerCase())
+      );
+    }
+    return course || null;
+  }
+
   /**
    * 1. Record Video Watch Progress
    * Enforces 90% playback completion rule, prevents trivial skips,
@@ -67,6 +100,9 @@ class ProgressService {
           .select('id, student_id, course_id, progress, completed_lessons')
           .eq('id', enrollmentId)
           .maybeSingle();
+        if (enr && enr.student_id && enr.student_id !== student.id) {
+          throw { statusCode: 403, message: 'Unauthorized: Enrollment does not belong to authenticated student.' };
+        }
         enrollment = enr;
       }
     }
@@ -85,7 +121,29 @@ class ProgressService {
 
     const resolvedCourseId = courseId || enrollment?.course_id;
 
-    // 3. Upsert into lesson_video_progress
+    // 3. Prevent Out-of-Order Multi-Tab Regressions
+    // Fetch existing progress from memory or DB to ensure progress and completion monotonically increase
+    const cacheKey = `${student.id}_${lessonId}`;
+    const prevCache = memoryProgressStore.get(cacheKey) || {};
+
+    let existingProg = null;
+    try {
+      const { data: dbProg } = await supabase
+        .from('lesson_video_progress')
+        .select('watched_position_seconds, watched_duration_seconds, completion_percent, is_completed, completed_at')
+        .eq('student_id', student.id)
+        .eq('lesson_id', String(lessonId))
+        .maybeSingle();
+      existingProg = dbProg;
+    } catch (e) {}
+
+    const maxPercent = Math.max(completionPercent, prevCache.completion_percent || 0, existingProg?.completion_percent || 0);
+    const maxWatched = Math.max(watched, prevCache.watched_duration_seconds || 0, existingProg?.watched_duration_seconds || 0);
+    const finalCompleted = Boolean(isCompleted || prevCache.is_completed || existingProg?.is_completed || maxPercent >= 90);
+    const completedAtTimestamp = finalCompleted
+      ? (existingProg?.completed_at || prevCache.completed_at || new Date().toISOString())
+      : null;
+
     const videoProgressPayload = {
       student_id: student.id,
       enrollment_id: enrollment?.id || null,
@@ -93,23 +151,20 @@ class ProgressService {
       lesson_id: String(lessonId),
       module_id: moduleId ? String(moduleId) : null,
       watched_position_seconds: pos,
-      watched_duration_seconds: watched,
+      watched_duration_seconds: maxWatched,
       total_duration_seconds: total,
-      completion_percent: completionPercent,
-      is_completed: isCompleted,
-      completed_at: isCompleted ? new Date().toISOString() : null,
+      completion_percent: maxPercent,
+      is_completed: finalCompleted,
+      completed_at: completedAtTimestamp,
       last_watched_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
     };
 
-    // Store in memory cache
-    const cacheKey = `${student.id}_${lessonId}`;
-    const prevCache = memoryProgressStore.get(cacheKey) || {};
     memoryProgressStore.set(cacheKey, {
       ...prevCache,
       ...videoProgressPayload,
-      // If already completed previously, keep completed state
-      is_completed: prevCache.is_completed || isCompleted
+      is_completed: finalCompleted,
+      completion_percent: maxPercent
     });
 
     try {
@@ -145,42 +200,38 @@ class ProgressService {
     let completedLessonsCount = 0;
 
     if (resolvedCourseId) {
-      const { data: courseData } = await supabase
-        .from('courses')
-        .select('id, curriculum_modules')
-        .or(`id.eq.${resolvedCourseId},slug.eq.${resolvedCourseId}`)
-        .maybeSingle();
+      const courseData = await this.findCourse(resolvedCourseId);
 
       if (courseData && Array.isArray(courseData.curriculum_modules)) {
-        // Collect all published lessons
-        const allCourseLessons = [];
-        for (const mod of courseData.curriculum_modules) {
-          if (Array.isArray(mod.lessons)) {
-            for (const l of mod.lessons) {
-              allCourseLessons.push({ lessonId: String(l.id), moduleId: mod.id });
-            }
-          }
-        }
-        totalLessonsCount = allCourseLessons.length;
+        const modules = courseData.curriculum_modules;
+        totalLessonsCount = modules.length;
 
         // Query all completed lessons for this student
         const { data: completedRecords } = await supabase
           .from('lesson_video_progress')
-          .select('lesson_id, is_completed')
+          .select('lesson_id, module_id, is_completed')
           .eq('student_id', student.id)
           .eq('is_completed', true);
 
         const completedLessonSet = new Set((completedRecords || []).map(r => String(r.lesson_id)));
-        
+        (completedRecords || []).forEach(r => {
+          if (r.module_id) completedLessonSet.add(String(r.module_id));
+        });
+
         // Also check memory cache
-        for (const l of allCourseLessons) {
-          const mKey = `${student.id}_${l.lessonId}`;
-          if (memoryProgressStore.get(mKey)?.is_completed) {
-            completedLessonSet.add(l.lessonId);
+        for (const [k, v] of memoryProgressStore.entries()) {
+          if (k.startsWith(`${student.id}_`) && v.is_completed) {
+            const lesId = k.slice(student.id.length + 1);
+            completedLessonSet.add(lesId);
           }
         }
 
-        completedLessonsCount = allCourseLessons.filter(l => completedLessonSet.has(l.lessonId)).length;
+        completedLessonsCount = modules.filter((m, idx) => {
+          const modId = String(m.id || idx + 1);
+          const videoAssetId = m.video_asset_id ? String(m.video_asset_id) : null;
+          return completedLessonSet.has(modId) || (videoAssetId && completedLessonSet.has(videoAssetId));
+        }).length;
+
         if (totalLessonsCount > 0) {
           courseProgress = Math.min(100, Math.round((completedLessonsCount / totalLessonsCount) * 100));
         }
@@ -207,8 +258,10 @@ class ProgressService {
       status: 'SUCCESS',
       lessonId,
       currentPositionSeconds: pos,
-      completionPercent,
-      isCompleted,
+      watchedPositionSeconds: pos,
+      watchedDurationSeconds: maxWatched,
+      completionPercent: maxPercent,
+      isCompleted: finalCompleted,
       courseProgress,
       completedLessons: completedLessonsCount,
       totalLessons: totalLessonsCount,
@@ -217,7 +270,7 @@ class ProgressService {
   }
 
   /**
-   * 2. Retrieve Course & Module Progress Breakdown
+   * 2. Get Course Progress Breakdown
    */
   async getCourseProgress(user, courseId) {
     if (!user || !user.email) {
@@ -235,12 +288,8 @@ class ProgressService {
       throw { statusCode: 404, message: 'Student not found.' };
     }
 
-    // 1. Fetch Course Curriculum
-    const { data: course } = await supabase
-      .from('courses')
-      .select('id, title, slug, curriculum_modules')
-      .or(`id.eq.${courseId},slug.eq.${courseId}`)
-      .maybeSingle();
+    // 1. Fetch Course Curriculum (supports UUID, slug, and title)
+    const course = await this.findCourse(courseId);
 
     if (!course) {
       throw { statusCode: 404, message: 'Course not found.' };
@@ -255,6 +304,7 @@ class ProgressService {
     const progressMap = new Map();
     (dbProgress || []).forEach(p => {
       progressMap.set(String(p.lesson_id), p);
+      if (p.module_id) progressMap.set(String(p.module_id), p);
     });
 
     // Merge in-memory cache entries
@@ -269,48 +319,67 @@ class ProgressService {
 
     // 3. Roll up Module & Course Stats
     const modules = course.curriculum_modules || [];
-    let totalLessons = 0;
+    const totalLessons = modules.length;
     let completedLessons = 0;
 
-    const moduleStats = modules.map(m => {
-      const lessons = m.lessons || [];
-      const mTotal = lessons.length;
-      let mCompleted = 0;
+    const moduleStats = modules.map((m, idx) => {
+      const modId = String(m.id || idx + 1);
+      const videoAssetId = m.video_asset_id ? String(m.video_asset_id) : null;
+      const prog = progressMap.get(modId) || (videoAssetId ? progressMap.get(videoAssetId) : null);
+      const isComp = Boolean(prog?.is_completed);
 
-      const lessonsProgress = lessons.map(l => {
-        totalLessons++;
-        const prog = progressMap.get(String(l.id));
-        const isComp = Boolean(prog?.is_completed);
-        if (isComp) {
-          completedLessons++;
-          mCompleted++;
-        }
-        return {
-          lessonId: l.id,
-          title: l.title || l.name,
-          duration: l.duration,
-          isCompleted: isComp,
-          completionPercent: prog?.completion_percent || 0,
-          lastPositionSeconds: prog?.watched_position_seconds || 0
-        };
-      });
+      if (isComp) {
+        completedLessons++;
+      }
 
-      const mPercent = mTotal > 0 ? Math.round((mCompleted / mTotal) * 100) : 0;
+      const rawTopics = Array.isArray(m.topics) && m.topics.length > 0
+        ? m.topics
+        : (Array.isArray(m.lessons) ? m.lessons : []);
+
       return {
-        moduleId: m.id,
-        title: m.title || m.name,
-        totalLessons: mTotal,
-        completedLessons: mCompleted,
-        progressPercent: mPercent,
-        lessons: lessonsProgress
+        moduleId: m.id || idx + 1,
+        title: m.title || m.name || `Module ${idx + 1}`,
+        duration: m.duration,
+        isCompleted: isComp,
+        completionPercent: prog?.completion_percent || 0,
+        lastPositionSeconds: prog?.watched_position_seconds || 0,
+        topics: rawTopics.map((t, tIdx) => typeof t === "string" ? t : (t?.title || t?.name || `Topic ${tIdx + 1}`)).filter(Boolean)
       };
     });
 
     const overallProgress = totalLessons > 0 ? Math.round((completedLessons / totalLessons) * 100) : 0;
     const isEligibleForCertificate = overallProgress >= 90;
 
-    // Check certificate request status
-    const certRequest = memoryCertificateRequests.get(`${student.id}_${course.id}`);
+    // Check certificate request status from DB first (ARCH-12 fix)
+    let certRequest = null;
+    try {
+      const { data: dbCert } = await supabase
+        .from('certificate_requests')
+        .select('*')
+        .eq('student_id', student.id)
+        .eq('course_id', course.id)
+        .order('requested_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (dbCert) {
+        certRequest = {
+          status: dbCert.status,
+          certificateId: dbCert.certificate_id
+        };
+      }
+    } catch (e) {}
+
+    // Fallback to memory store if table is connecting
+    if (!certRequest) {
+      const memReq = memoryCertificateRequests.get(`${student.id}_${course.id}`);
+      if (memReq) {
+        certRequest = {
+          status: memReq.status,
+          certificateId: memReq.certificateId || memReq.certificate_id
+        };
+      }
+    }
 
     return {
       status: 'SUCCESS',
@@ -328,7 +397,7 @@ class ProgressService {
 
   /**
    * 3. Submit Certificate Request (Admin Approval Workflow)
-   * Does NOT auto-issue; registers request with status PENDING_APPROVAL.
+   * Enforces >= 90% progress and persists into certificate_requests table (ARCH-12 fix).
    */
   async requestCertificate(user, { enrollmentId, courseId, fullName, collegeName }) {
     if (!user || !user.email) {
@@ -346,6 +415,20 @@ class ProgressService {
       throw { statusCode: 404, message: 'Student profile not found.' };
     }
 
+    if (enrollmentId) {
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(enrollmentId);
+      if (isUuid) {
+        const { data: enr } = await supabase
+          .from('enrollments')
+          .select('id, student_id')
+          .eq('id', enrollmentId)
+          .maybeSingle();
+        if (enr && enr.student_id && enr.student_id !== student.id) {
+          throw { statusCode: 403, message: 'Unauthorized: Enrollment does not belong to authenticated student.' };
+        }
+      }
+    }
+
     // Verify Eligibility
     const progressData = await this.getCourseProgress(user, courseId);
     if (progressData.overallProgress < 90) {
@@ -355,22 +438,66 @@ class ProgressService {
       };
     }
 
+    // Prevent duplicate active certificate requests
+    try {
+      const { data: existingReq } = await supabase
+        .from('certificate_requests')
+        .select('*')
+        .eq('student_id', student.id)
+        .eq('course_id', progressData.courseId)
+        .order('requested_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (existingReq) {
+        return {
+          status: 'SUCCESS',
+          certificateId: existingReq.certificate_id,
+          requestStatus: existingReq.status,
+          message: existingReq.status === 'APPROVED'
+            ? 'Certificate has already been verified and approved.'
+            : 'Certificate application has been submitted and is currently under review.'
+        };
+      }
+    } catch (checkErr) {}
+
     const certId = `IN-${(progressData.courseTitle || 'NLS').slice(0, 3).toUpperCase()}-2026-${student.id.slice(0, 4).toUpperCase()}`;
     const requestKey = `${student.id}_${progressData.courseId}`;
 
     const requestRecord = {
+      certificate_id: certId,
       certificateId: certId,
+      student_id: student.id,
       studentId: student.id,
+      course_id: progressData.courseId,
       courseId: progressData.courseId,
-      enrollmentId: enrollmentId || null,
-      studentName: fullName || student.full_name || 'Student',
-      collegeName: collegeName || student.college || 'InternNetra Academy',
+      enrollment_id: enrollmentId || null,
+      student_name: fullName || student.full_name || 'Student',
+      college_name: collegeName || student.college || 'InternNetra Academy',
       status: 'PENDING_APPROVAL', // Admin approval strictly required!
+      requested_at: new Date().toISOString(),
       requestedAt: new Date().toISOString(),
-      approvedAt: null
+      approved_at: null
     };
 
+    // 1. Keep in memory store for immediate local resolution
     memoryCertificateRequests.set(requestKey, requestRecord);
+
+    // 2. Persist authoritatively in Supabase certificate_requests table (survives restart)
+    try {
+      await supabase.from('certificate_requests').upsert({
+        certificate_id: certId,
+        student_id: student.id,
+        course_id: progressData.courseId,
+        enrollment_id: enrollmentId || null,
+        student_name: requestRecord.student_name,
+        college_name: requestRecord.college_name,
+        status: 'PENDING_APPROVAL',
+        requested_at: requestRecord.requested_at
+      }, { onConflict: 'certificate_id' });
+    } catch (dbErr) {
+      console.warn('⚠️ [Certificate Request DB Notice]:', dbErr.message);
+    }
 
     return {
       status: 'SUCCESS',

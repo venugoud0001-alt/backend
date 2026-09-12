@@ -13,12 +13,23 @@ class PricingRepository {
     if (isUuid) {
       query = query.eq("id", clean);
     } else {
-      query = query.eq("slug", clean);
+      query = query.ilike("slug", clean);
     }
 
     const { data: courses, error } = await query.limit(1);
-    if (error || !courses || courses.length === 0) return null;
-    return courses[0];
+    if (!error && courses && courses.length > 0) return courses[0];
+
+    // Fallback search by title if slug didn't match
+    if (!isUuid) {
+      const { data: titleCourses } = await supabase
+        .from("courses")
+        .select("id, title, slug, price, installment_price, status, is_published")
+        .ilike("title", `%${clean.replace(/[-_]/g, " ")}%`)
+        .limit(1);
+      if (titleCourses && titleCourses.length > 0) return titleCourses[0];
+    }
+
+    return null;
   }
 
   /**

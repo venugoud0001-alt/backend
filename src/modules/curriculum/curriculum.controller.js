@@ -104,8 +104,9 @@ class CurriculumController {
   async getModule(req, res, next) {
     try {
       const { id } = req.params;
-      console.log(`\n📥 [MODULE READ FLOW] GET /api/modules/${id}`);
-      const moduleItem = await curriculumService.getModuleById(id);
+      const courseId = req.query.courseId || req.query.course_id;
+      console.log(`\n📥 [MODULE READ FLOW] GET /api/modules/${id} (courseId: ${courseId || 'NONE'})`);
+      const moduleItem = await curriculumService.getModuleById(id, courseId);
       if (!moduleItem) {
         return res.status(404).json({ status: 'ERROR', message: 'Module not found.' });
       }
@@ -119,10 +120,11 @@ class CurriculumController {
   async updateModule(req, res, next) {
     try {
       const { id } = req.params;
+      const courseId = req.query.courseId || req.query.course_id || req.body?.courseId || req.body?.course_id || req.validatedData?.course_id;
       console.log('\n============================================================');
-      console.log(` 🧩 [MODULE UPDATE DATA FLOW] ID: ${id}, Payload Received:`);
+      console.log(` 🧩 [MODULE UPDATE DATA FLOW] ID: ${id}, Course ID: ${courseId || 'UNSPECIFIED'}, Payload Received:`);
       console.log(JSON.stringify(req.validatedData || req.body, null, 2));
-      const moduleItem = await curriculumService.updateModule(id, req.validatedData);
+      const moduleItem = await curriculumService.updateModule(id, req.validatedData || req.body, courseId);
       console.log(' 🧩 [MODULE UPDATE DATA FLOW] Updated in DB:');
       console.log(JSON.stringify(moduleItem, null, 2));
       console.log('============================================================\n');

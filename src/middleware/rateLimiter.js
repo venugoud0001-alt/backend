@@ -20,8 +20,23 @@ const paymentLimiter = rateLimit({
   message: { status: 'ERROR', message: 'Too many payment requests. Please try again later.' },
 });
 
+const heavyVideoOpsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 30, // max 30 operations per 15 min per user/IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { keyGeneratorIpFallback: false },
+  keyGenerator: (req) => req.user?.id || req.user?.email || req.ip,
+  message: {
+    success: false,
+    code: 'RATE_LIMIT_EXCEEDED',
+    message: 'Video upload and transcoding rate limit exceeded. Please wait a few minutes before starting new jobs.'
+  }
+});
+
 module.exports = {
   authRateLimiter,
   otpSendLimiter,
-  paymentLimiter
+  paymentLimiter,
+  heavyVideoOpsLimiter
 };

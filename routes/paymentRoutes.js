@@ -14,10 +14,12 @@ const couponService = require('../src/modules/coupons/coupon.service');
 const pricingService = require('../src/modules/pricing/pricing.service');
 const { calculateDiscountedPricing } = require('../src/utils/pricingEngine');
 const { getStudentEnrollments } = require('../src/modules/enrollments/studentEnrollment.controller');
+const manualEnrollmentController = require('../src/modules/enrollments/studentManualEnrollment.controller');
 const { addCalendarMonths } = require('../src/utils/dateUtils');
+const installmentService = require('../src/services/installment.service');
 
-// Authoritative Student Enrollments Endpoint
-router.get(['/student/enrollments', '/enrollments/my-enrollments'], getStudentEnrollments);
+// Authoritative Student Enrollments Endpoint (Enforces Student Isolation via authenticateJWT)
+router.get(['/student/enrollments', '/enrollments/my-enrollments'], authenticateJWT, getStudentEnrollments);
 
 // Cashfree HMAC Signature Verification Helper (Constant-Time Verification)
 function verifyCashfreeWebhookSignature(req) {
@@ -52,15 +54,39 @@ function verifyCashfreeWebhookSignature(req) {
   }
 }
 
+// ARCH-10: In-flight checkout locks to prevent duplicate pending orders during rapid clicks
+const inFlightCheckoutLocks = new Map();
+
 // Authoritative Payment Order Creation
 router.post(['/payments/create-enrollment-order', '/payments/create-order'], paymentLimiter, async (req, res, next) => {
+  const studentEmail = req.body.email || req.body.studentEmail;
+  const courseId = req.body.courseId || req.body.course_id;
+  const lockKey = `${String(studentEmail || '').toLowerCase().trim()}_${courseId}_${req.body.paymentPlan || 'FULL'}`;
+
+  if (inFlightCheckoutLocks.has(lockKey)) {
+    try {
+      const existingResult = await inFlightCheckoutLocks.get(lockKey);
+      return res.status(200).json(existingResult);
+    } catch (lockErr) {
+      // If the earlier request errored, allow this attempt to proceed fresh
+    }
+  }
+
+  let resolveLock, rejectLock;
+  const lockPromise = new Promise((resolve, reject) => {
+    resolveLock = resolve;
+    rejectLock = reject;
+  });
+  inFlightCheckoutLocks.set(lockKey, lockPromise);
+
   try {
-    const { courseId, batchId, paymentPlan = "FULL", couponCode = "", name, email, phone, returnUrl } = req.body;
+    const { batchId, paymentPlan = "FULL", couponCode = "", name, phone, returnUrl } = req.body;
     const studentName = name || req.body.studentName || "Student";
-    const studentEmail = email || req.body.email;
 
     if (!studentEmail) {
-      return res.status(400).json({ status: 'ERROR', message: 'Student email is required for payment checkout.' });
+      const errRes = { status: 'ERROR', message: 'Student email is required for payment checkout.' };
+      resolveLock(errRes);
+      return res.status(400).json(errRes);
     }
 
     const normalizedEmail = studentEmail.toLowerCase().trim();
@@ -94,7 +120,9 @@ router.post(['/payments/create-enrollment-order', '/payments/create-order'], pay
     }
 
     if (!course) {
-      return res.status(404).json({ status: 'ERROR', message: `Course not found for identifier '${courseId || requestedCourseName}'.` });
+      const notFoundRes = { status: 'ERROR', message: `Course not found for identifier '${courseId || requestedCourseName}'.` };
+      resolveLock(notFoundRes);
+      return res.status(404).json(notFoundRes);
     }
 
     // Authoritative Server-Side Coupon Validation & Pricing Calculation
@@ -108,28 +136,14 @@ router.post(['/payments/create-enrollment-order', '/payments/create-order'], pay
         });
         validatedCoupon = valResult.coupon;
       } catch (couponErr) {
-        console.warn(`[CHECKOUT] Coupon validation note for '${couponCode}':`, couponErr.message || couponErr);
+        console.warn("Coupon validation warning:", couponErr.message);
       }
     }
 
-    // Fetch authoritative pricing plans from pricingService
-    const pricingData = await pricingService.getPricingForCourse(course.id).catch((err) => {
-      console.warn(`[CHECKOUT] Note fetching pricing for '${course.id}':`, err.message);
-      return null;
-    });
-
-    const plans = pricingData?.pricingPlans || [];
-    const fullPlan = plans.find(p => p.paymentMode === "FULL");
-    const installmentPlan = plans.find(p => p.paymentMode === "INSTALLMENT");
-    const activePlan = paymentPlan === "INSTALLMENT" ? installmentPlan : fullPlan;
-    const activePhases = installmentPlan?.phases || [];
-
-    const pricing = calculateDiscountedPricing({
-      course,
-      pricingPlan: activePlan ? { total_amount: activePlan.totalAmount } : null,
-      installments: activePhases.map(p => ({ amount: p.amount, phase_number: p.phaseNumber })),
-      coupon: validatedCoupon,
-      paymentMode: paymentPlan
+    const pricing = await pricingService.getPricingForCourse({
+      courseId: course.id,
+      paymentMode: paymentPlan,
+      coupon: validatedCoupon
     });
 
     const totalCoursePrice = pricing.discountedTotal;
@@ -149,15 +163,32 @@ router.post(['/payments/create-enrollment-order', '/payments/create-order'], pay
       const { data: batchData } = await supabase.from('batches').select('id, capacity, enrolled_count, status').eq('id', batchId).maybeSingle();
       if (batchData) {
         if (batchData.status === 'CLOSED' || batchData.status === 'FULL' || batchData.enrolled_count >= batchData.capacity) {
-          return res.status(400).json({ status: 'ERROR', message: 'Selected batch is full. Please select another batch.' });
+          const batchFullRes = { status: 'ERROR', message: 'Selected batch is full. Please select another batch.' };
+          resolveLock(batchFullRes);
+          return res.status(400).json(batchFullRes);
         }
         batch = batchData;
       }
     }
 
-    // Student Record
+    // Student Record Lookup or Creation
     let { data: student } = await supabase.from('students').select('id, email, full_name, phone, account_status').ilike('email', normalizedEmail).maybeSingle();
-    if (!student) {
+    if (student) {
+      // Check if student is already fully enrolled in this course
+      const { data: activeEnr } = await supabase.from('enrollments')
+        .select('id, course_access_status, payment_status')
+        .eq('student_id', student.id)
+        .eq('course_id', course.id)
+        .or('course_access_status.eq.ACTIVE,course_access_status.eq.UNLOCKED,payment_status.eq.PAID')
+        .limit(1)
+        .maybeSingle();
+
+      if (activeEnr) {
+        const alreadyRes = { status: 'ALREADY_ENROLLED', message: 'You are already enrolled in this course.' };
+        resolveLock(alreadyRes);
+        return res.status(200).json(alreadyRes);
+      }
+    } else {
       const { data: newStudent } = await supabase.from('students').insert([{
         email: normalizedEmail,
         full_name: studentName,
@@ -168,21 +199,83 @@ router.post(['/payments/create-enrollment-order', '/payments/create-order'], pay
       student = newStudent;
     }
 
-    // Pending Enrollment
-    const { data: enrollment, error: enrErr } = await supabase.from('enrollments').insert([{
-      student_id: student?.id,
-      course_id: course.id,
-      course_name: course.title,
-      total_amount: totalCoursePrice,
-      amount_paid: 0,
-      amount_pending: totalCoursePrice,
-      payment_plan: paymentPlan,
-      payment_status: "PAYMENT_PENDING",
-      course_access_status: "LOCKED",
-      account_status: "NOT_ACTIVATED"
-    }]).select().single();
+    // ARCH-10 Deduplication: Check if an active pending enrollment and CREATED order exist from the last 15 minutes
+    const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    let enrollment = null;
 
-    if (enrErr) throw enrErr;
+    const { data: existingPendingEnrollment } = await supabase
+      .from('enrollments')
+      .select('id, course_id, payment_plan, payment_status, course_access_status, created_at')
+      .eq('student_id', student.id)
+      .eq('course_id', course.id)
+      .eq('payment_status', 'PAYMENT_PENDING')
+      .gte('created_at', fifteenMinutesAgo)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (existingPendingEnrollment) {
+      const { data: existingOrder } = await supabase
+        .from('orders')
+        .select('order_id, cashfree_order_id, amount, status')
+        .eq('enrollment_id', existingPendingEnrollment.id)
+        .eq('status', 'CREATED')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (existingOrder && Math.round(Number(existingOrder.amount)) === Math.round(Number(orderAmount))) {
+        try {
+          const isSandbox = CASHFREE_ENV === "SANDBOX";
+          const cashfreeEndpoint = isSandbox
+            ? `https://sandbox.cashfree.com/pg/orders/${existingOrder.order_id}`
+            : `https://api.cashfree.com/pg/orders/${existingOrder.order_id}`;
+          const cfCheckRes = await fetch(cashfreeEndpoint, {
+            method: "GET",
+            headers: {
+              "x-api-version": "2023-08-01",
+              "x-client-id": CASHFREE_CLIENT_ID,
+              "x-client-secret": CASHFREE_CLIENT_SECRET,
+            },
+          });
+          if (cfCheckRes.ok) {
+            const cfData = await cfCheckRes.json();
+            if (cfData.order_status === "ACTIVE" && cfData.payment_session_id) {
+              const reuseResponse = {
+                status: 'SUCCESS',
+                orderId: existingOrder.order_id,
+                paymentSessionId: cfData.payment_session_id,
+                amount: orderAmount,
+                mode: isSandbox ? "sandbox" : "production",
+              };
+              resolveLock(reuseResponse);
+              return res.status(200).json(reuseResponse);
+            }
+          }
+        } catch (cfErr) {
+          console.warn("Could not reuse existing Cashfree order session:", cfErr.message);
+        }
+      }
+      enrollment = existingPendingEnrollment;
+    }
+
+    if (!enrollment) {
+      const { data: newEnrollment, error: enrErr } = await supabase.from('enrollments').insert([{
+        student_id: student?.id,
+        course_id: course.id,
+        course_name: course.title,
+        total_amount: totalCoursePrice,
+        amount_paid: 0,
+        amount_pending: totalCoursePrice,
+        payment_plan: paymentPlan,
+        payment_status: "PAYMENT_PENDING",
+        course_access_status: "LOCKED",
+        account_status: "NOT_ACTIVATED"
+      }]).select().single();
+
+      if (enrErr) throw enrErr;
+      enrollment = newEnrollment;
+    }
 
     // Internal Order Row
     const orderId = `ENR_${enrollment.id.slice(0, 8)}_${Date.now().toString().slice(-6)}`;
@@ -253,18 +346,27 @@ router.post(['/payments/create-enrollment-order', '/payments/create-order'], pay
 
     const data = await response.json();
     if (!response.ok || !data.payment_session_id) {
-      return res.status(400).json({ status: 'ERROR', message: data.message || 'Failed to create Cashfree order.' });
+      const errRes = { status: 'ERROR', message: data.message || 'Failed to create Cashfree order.' };
+      resolveLock(errRes);
+      return res.status(400).json(errRes);
     }
 
-    res.status(200).json({
+    const successRes = {
       status: 'SUCCESS',
       orderId: data.order_id || orderId,
       paymentSessionId: data.payment_session_id,
       amount: orderAmount,
       mode: isSandbox ? "sandbox" : "production",
-    });
+    };
+    resolveLock(successRes);
+    res.status(200).json(successRes);
   } catch (err) {
+    if (rejectLock) rejectLock(err);
     next(err);
+  } finally {
+    setTimeout(() => {
+      inFlightCheckoutLocks.delete(lockKey);
+    }, 2000);
   }
 });
 
@@ -294,6 +396,13 @@ router.post('/payments/create-installment-order', paymentLimiter, async (req, re
         .eq('id', enrollmentId)
         .maybeSingle();
       if (!error) enrollment = data;
+
+      if (student && enrollment && enrollment.student_id && enrollment.student_id !== student.id) {
+        return res.status(403).json({
+          status: 'ERROR',
+          message: 'Unauthorized: Enrollment does not belong to this student.'
+        });
+      }
     }
 
     if (!enrollment && student) {
@@ -549,16 +658,17 @@ router.post(['/payments/verify-order', '/payments/verify'], async (req, res, nex
           const nowIso = new Date().toISOString();
           const expiryIso = addCalendarMonths(nowIso, 6).toISOString();
 
-          await supabase.from("enrollments").update({
-            payment_status: isFullPaid ? "PAID" : "PARTIALLY_PAID",
-            amount_paid: matchedEnrollment.amount_paid,
-            amount_pending: remainingBal,
-            course_access_status: "UNLOCKED",
-            account_status: "ACTIVE",
-            access_start_date: nowIso,
-            access_expiry_date: expiryIso,
-            updated_at: nowIso
-          }).eq("id", matchedOrder.enrollment_id);
+          await installmentService.handlePaymentSettlement({
+            enrollmentId: matchedOrder.enrollment_id,
+            amountPaid: amountPaid,
+            txnId: txnId
+          });
+
+          // Fetch authoritative fresh enrollment
+          const { data: freshEnr } = await supabase.from("enrollments").select("*").eq("id", matchedOrder.enrollment_id).maybeSingle();
+          if (freshEnr) {
+            matchedEnrollment = freshEnr;
+          }
         }
       } catch (syncErr) {
         console.warn("Auto-sync Cashfree payment note:", syncErr.message);
@@ -923,9 +1033,18 @@ router.post('/webhooks/cashfree', async (req, res) => {
       if (internalOrder?.enrollment_id) {
         const { data } = await supabase.from('enrollments').select('id, student_id, course_id, course_name, total_amount, amount_paid, amount_pending, payment_plan, payment_status, course_access_status, batch_id').eq('id', internalOrder.enrollment_id).maybeSingle();
         enrollment = data;
-      } else {
-        const { data } = await supabase.from('enrollments').select('id, student_id, course_id, course_name, total_amount, amount_paid, amount_pending, payment_plan, payment_status, course_access_status, batch_id').ilike('email', email).maybeSingle();
-        enrollment = data;
+      } else if (email) {
+        // Resolve student first, then find latest enrollment for that student
+        const { data: studentRecord } = await supabase.from('students').select('id').ilike('email', email.trim()).maybeSingle();
+        if (studentRecord?.id) {
+          const { data } = await supabase.from('enrollments')
+            .select('id, student_id, course_id, course_name, total_amount, amount_paid, amount_pending, payment_plan, payment_status, course_access_status, batch_id')
+            .eq('student_id', studentRecord.id)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          enrollment = data;
+        }
       }
 
       if (!enrollment) {
@@ -972,6 +1091,15 @@ router.post('/webhooks/cashfree', async (req, res) => {
         await supabase.rpc('increment_batch_enrolled_count', { p_batch_id: enrollment.batch_id });
       }
 
+      if (enrollment?.id) {
+        await installmentService.handlePaymentSettlement({
+          enrollmentId: enrollment.id,
+          amountPaid: amountPaid,
+          txnId: String(cashfreePaymentId),
+          isWebhook: true
+        });
+      }
+
       return res.status(200).json({ status: 'SUCCESS', orderId: cashfreeOrderId, paymentId: cashfreePaymentId });
     }
 
@@ -979,10 +1107,141 @@ router.post('/webhooks/cashfree', async (req, res) => {
       return res.status(200).json({ status: 'SUCCESS', message: 'Idempotent request.', result: rpcResult });
     }
 
+    // Connect installmentService hook for priority restoration and date auditing
+    const resolvedEnrId = rpcResult?.enrollment_id;
+    if (resolvedEnrId) {
+      await installmentService.handlePaymentSettlement({
+        enrollmentId: resolvedEnrId,
+        amountPaid: amountPaid,
+        txnId: String(cashfreePaymentId),
+        isWebhook: true
+      });
+    }
+
     res.status(200).json({ status: 'SUCCESS', orderId: cashfreeOrderId, paymentId: cashfreePaymentId, result: rpcResult });
   } catch (err) {
     res.status(500).json({ status: 'ERROR', message: 'Webhook processing exception.' });
   }
 });
+
+// =========================================================================
+// ADMIN INSTALLMENT & ACCESS CONTROL ENDPOINTS
+// =========================================================================
+
+// Admin Manual Suspend Course Access
+router.post('/admin/enrollments/:id/suspend', authenticateJWT, requireAdminRole, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { reason = 'MANUAL_ADMIN', notes = '' } = req.body || {};
+    const adminEmail = req.user?.email || 'admin@internnetra.com';
+    const adminId = req.user?.id || null;
+
+    const updated = await installmentService.manualSuspendAccess({
+      enrollmentId: id,
+      adminEmail,
+      adminId,
+      reason,
+      notes
+    });
+
+    res.status(200).json({
+      status: 'SUCCESS',
+      message: 'Course access manually suspended by administrator.',
+      enrollment: updated
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin Manual Restore Course Access
+router.post('/admin/enrollments/:id/restore', authenticateJWT, requireAdminRole, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { reason = 'MANUAL_ADMIN', notes = '' } = req.body || {};
+    const adminEmail = req.user?.email || 'admin@internnetra.com';
+    const adminId = req.user?.id || null;
+
+    const updated = await installmentService.manualRestoreAccess({
+      enrollmentId: id,
+      adminEmail,
+      adminId,
+      reason,
+      notes
+    });
+
+    res.status(200).json({
+      status: 'SUCCESS',
+      message: 'Course access manually restored by administrator.',
+      enrollment: updated
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin Installment Ledger with Full Due Date & Suspension Details
+router.get(['/admin/enrollments/installments-ledger', '/admin/installment-ledger'], authenticateJWT, requireAdminRole, async (req, res, next) => {
+  try {
+    const ledger = await installmentService.getAdminInstallmentLedger();
+    res.status(200).json({
+      status: 'SUCCESS',
+      count: ledger.length,
+      data: ledger
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin Trigger Overdue Check Sweep
+router.post('/admin/enrollments/trigger-overdue-sweep', authenticateJWT, requireAdminRole, async (req, res, next) => {
+  try {
+    const result = await installmentService.sweepOverdueInstallments();
+    res.status(200).json({
+      status: 'SUCCESS',
+      message: 'Overdue installment sweep executed successfully.',
+      result
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// =========================================================================
+// ADMIN MANUAL STUDENT CREATION + COURSE ENROLLMENT + PAYMENT PLAN
+// =========================================================================
+
+// Check if student email exists
+router.get(
+  ['/admin/students/check-email', '/students/check-email'],
+  authenticateJWT,
+  requireAdminRole,
+  manualEnrollmentController.checkStudentEmail
+);
+
+// Search existing students
+router.get(
+  ['/admin/students/search', '/students/search'],
+  authenticateJWT,
+  requireAdminRole,
+  manualEnrollmentController.searchExistingStudents
+);
+
+// Create student & enroll with payment plan
+router.post(
+  ['/admin/students/manual-enrollment', '/admin/students/enroll', '/students/manual-enrollment'],
+  authenticateJWT,
+  requireAdminRole,
+  manualEnrollmentController.createStudentAndEnroll
+);
+
+// Retry enrollment email delivery
+router.post(
+  ['/admin/students/retry-enrollment-email', '/admin/enrollments/retry-email'],
+  authenticateJWT,
+  requireAdminRole,
+  manualEnrollmentController.retryEnrollmentEmail
+);
 
 module.exports = router;

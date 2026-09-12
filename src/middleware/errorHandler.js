@@ -4,11 +4,15 @@ const { errorResponse } = require('../utils/response');
  * Centralized Global Error Handler Middleware
  */
 function errorHandler(err, req, res, next) {
-  // Always log detailed server error for debugging
-  console.error('🚨 [Server Exception]:', err);
-
   const status = err.status || err.statusCode || 500;
   const isProd = process.env.NODE_ENV === 'production';
+
+  // Differentiate expected 4xx client/pipeline states from true 5xx internal server errors
+  if (status >= 500) {
+    console.error('🚨 [Internal Server Error 500]:', err);
+  } else {
+    console.log(`ℹ️ [API Notice ${status}]:`, err.message || err);
+  }
 
   // Sanitized message logic to prevent database leak
   let userMessage = err.message || 'An internal server error occurred.';

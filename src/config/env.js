@@ -17,6 +17,7 @@ for (const key of requiredEnv) {
   if (!process.env[key]) {
     if (process.env.NODE_ENV === 'production') {
       console.error(`❌ Configuration Error: Required environment variable is missing: ${key}`);
+      process.exit(1);
     } else {
       console.warn(`⚠️ Warning: Required environment variable missing: ${key}`);
     }
@@ -48,11 +49,25 @@ module.exports = {
   AWS_S3_BUCKET_OUTPUT: process.env.AWS_S3_HLS_BUCKET || process.env.AWS_S3_BUCKET_OUTPUT || 'internnetra-lms-videos-prod-365957110532-ap-south-1-an',
   AWS_MEDIACONVERT_ENDPOINT: process.env.AWS_MEDIACONVERT_ENDPOINT || '',
   AWS_MEDIACONVERT_ROLE_ARN: process.env.AWS_MEDIACONVERT_ROLE_ARN || '',
+  AWS_WEBHOOK_SECRET: process.env.AWS_WEBHOOK_SECRET || '',
   CLOUDFRONT_DOMAIN: (process.env.CLOUDFRONT_DISTRIBUTION_DOMAIN && !process.env.CLOUDFRONT_DISTRIBUTION_DOMAIN.includes('NOT_CREATED')) 
     ? process.env.CLOUDFRONT_DISTRIBUTION_DOMAIN 
     : (process.env.CLOUDFRONT_DOMAIN && !process.env.CLOUDFRONT_DOMAIN.includes('NOT_CREATED')) 
       ? process.env.CLOUDFRONT_DOMAIN 
       : '',
   CLOUDFRONT_KEY_PAIR_ID: (process.env.CLOUDFRONT_KEY_PAIR_ID && !process.env.CLOUDFRONT_KEY_PAIR_ID.includes('NOT_CREATED')) ? process.env.CLOUDFRONT_KEY_PAIR_ID : '',
-  CLOUDFRONT_PRIVATE_KEY: (process.env.CLOUDFRONT_PRIVATE_KEY && !process.env.CLOUDFRONT_PRIVATE_KEY.includes('NOT_CREATED')) ? process.env.CLOUDFRONT_PRIVATE_KEY : ''
+  CLOUDFRONT_PRIVATE_KEY: (process.env.CLOUDFRONT_PRIVATE_KEY && !process.env.CLOUDFRONT_PRIVATE_KEY.includes('NOT_CREATED')) ? process.env.CLOUDFRONT_PRIVATE_KEY : '',
+
+  // S3 Multipart Upload Tuning
+  VIDEO_UPLOAD_PART_SIZE_MB: Number(process.env.VIDEO_UPLOAD_PART_SIZE_MB || 32),
+  VIDEO_UPLOAD_CONCURRENCY: Number(process.env.VIDEO_UPLOAD_CONCURRENCY || 6),
+  VIDEO_MULTIPART_THRESHOLD_MB: Number(process.env.VIDEO_MULTIPART_THRESHOLD_MB || 100),
+
+  // Video Security & Session Control (Levels 1-3)
+  VIDEO_ACCESS_TTL_SECONDS: Number(process.env.VIDEO_ACCESS_TTL_SECONDS || 900), // Default: 15 minutes
+  MAX_CONCURRENT_VIDEO_SESSIONS: Number(process.env.MAX_CONCURRENT_VIDEO_SESSIONS || 2),
+  ALLOWED_STREAMING_ORIGINS: (process.env.ALLOWED_STREAMING_ORIGINS || 'https://internnetra.com,https://www.internnetra.com,http://localhost:3000,http://localhost:5173')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean)
 };

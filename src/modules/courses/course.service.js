@@ -25,7 +25,7 @@ class CourseService {
 
     let query = supabase
       .from('courses')
-      .select('id, category_id, title, slug, short_description, description, image_url, duration, level, instructor_name, skills, price, installment_price, status, created_at, updated_at')
+      .select('id, category_id, title, slug, short_description, description, image_url, duration, level, instructor_name, skills, price, installment_price, status, created_at, updated_at, curriculum_modules')
       .order('title', { ascending: true });
 
     if (!isAdmin) {
@@ -62,6 +62,12 @@ class CourseService {
       const resolvedPrice = Number(pr?.sale_price || pr?.full_payment_amount || c.price || 4000);
       const resolvedInstallmentPrice = Number(pr?.installment_1_price || c.installment_price || 1500);
 
+      const curriculumMods = Array.isArray(c.curriculum_modules)
+        ? c.curriculum_modules
+        : (typeof c.curriculum_modules === 'string'
+          ? (() => { try { return JSON.parse(c.curriculum_modules); } catch { return []; } })()
+          : []);
+
       return {
         id: c.id,
         department_id: deptId,
@@ -85,6 +91,9 @@ class CourseService {
         students: c.students || '',
         display_order: c.display_order !== undefined ? c.display_order : index + 1,
         status: (c.status || 'PUBLISHED').toUpperCase(),
+        curriculum_modules: curriculumMods,
+        modules: curriculumMods,
+        modulesCount: curriculumMods.length,
         created_at: c.created_at,
         updated_at: c.updated_at
       };
@@ -565,40 +574,53 @@ class CourseService {
   }
 
   /**
-   * Fetch live academic dashboard statistics
+   * Fetch live academic dashboard statistics (with in-memory cache)
    */
   async getAcademicStats() {
-    const { count: deptCount } = await supabase.from('categories').select('*', { count: 'exact', head: true });
-    const { data: courses } = await supabase.from('courses').select('id, status, curriculum_modules');
-    const { count: pricingCount } = await supabase.from('course_pricing').select('*', { count: 'exact', head: true }).eq('is_active', true);
+    if (this._academicStatsCache && (Date.now() - (this._academicStatsCacheTime || 0) < 60000)) {
+      return this._academicStatsCache;
+    }
 
-    let totalModules = 0;
-    let totalTopics = 0;
-    let activeCourses = 0;
-    let draftCourses = 0;
+    try {
+      const { count: deptCount } = await supabase.from('categories').select('*', { count: 'exact', head: true });
+      const { data: courses } = await supabase.from('courses').select('id, status, curriculum_modules');
+      const { count: pricingCount } = await supabase.from('course_pricing').select('*', { count: 'exact', head: true }).eq('is_active', true);
 
-    (courses || []).forEach(c => {
-      const status = (c.status || '').toUpperCase();
-      if (['PUBLISHED', 'ACTIVE'].includes(status)) activeCourses++;
-      else draftCourses++;
+      let totalModules = 0;
+      let totalTopics = 0;
+      let activeCourses = 0;
+      let draftCourses = 0;
 
-      const mods = Array.isArray(c.curriculum_modules) ? c.curriculum_modules : [];
-      totalModules += mods.length;
-      mods.forEach(m => {
-        const lessons = Array.isArray(m.lessons) ? m.lessons : (Array.isArray(m.topics) ? m.topics : []);
-        totalTopics += lessons.length;
+      (courses || []).forEach(c => {
+        const status = (c.status || '').toUpperCase();
+        if (['PUBLISHED', 'ACTIVE'].includes(status)) activeCourses++;
+        else draftCourses++;
+
+        const mods = Array.isArray(c.curriculum_modules) ? c.curriculum_modules : [];
+        totalModules += mods.length;
+        mods.forEach(m => {
+          const lessons = Array.isArray(m.lessons) ? m.lessons : (Array.isArray(m.topics) ? m.topics : []);
+          totalTopics += lessons.length;
+        });
       });
-    });
 
-    return {
-      totalDepartments: deptCount || 0,
-      totalCourses: (courses || []).length,
-      totalModules,
-      totalTopics,
-      activeCourses,
-      draftCourses,
-      activePricingPlans: pricingCount || ((courses || []).length * 2)
-    };
+      const stats = {
+        totalDepartments: deptCount || 0,
+        totalCourses: (courses || []).length,
+        totalModules,
+        totalTopics,
+        activeCourses,
+        draftCourses,
+        activePricingPlans: pricingCount || ((courses || []).length * 2)
+      };
+
+      this._academicStatsCache = stats;
+      this._academicStatsCacheTime = Date.now();
+      return stats;
+    } catch (err) {
+      if (this._academicStatsCache) return this._academicStatsCache;
+      throw err;
+    }
   }
 }
 

@@ -6,9 +6,8 @@ const { supabase, JWT_SECRET } = require('../config/supabase');
 const { authRateLimiter, otpSendLimiter } = require('../middleware/rateLimiter');
 const { sendOtpEmail, sendWelcomeEmail } = require('../services/mailer');
 
-// Secure In-Memory Challenge Store (Challenge ID -> Hashed OTP, metadata, expiration, attempts, single-use reset tokens)
-const otpStore = new Map();
-const resetTokenStore = new Map();
+// Persistent OTP & Challenge Storage (ARCH-03 Fix)
+const otpPersistenceService = require('../src/services/otpPersistenceService');
 
 // Helper: Hash sensitive strings
 function hashSecret(secret) {
@@ -31,7 +30,7 @@ router.post('/auth/send-otp', otpSendLimiter, async (req, res, next) => {
     const otpHash = hashSecret(otp);
     const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
 
-    otpStore.set(normalizedEmail, {
+    await otpPersistenceService.setOtp(normalizedEmail, {
       otpHash,
       expiresAt,
       attempts: 0,
@@ -73,35 +72,36 @@ router.post('/auth/verify-otp', authRateLimiter, async (req, res, next) => {
     if (!email || !otp) return res.status(400).json({ status: 'ERROR', message: 'Email and OTP code are required.' });
 
     const key = email.toLowerCase().trim();
-    const record = otpStore.get(key);
+    const record = await otpPersistenceService.getOtp(key);
 
-    if (!record) {
+    if (!record || record.used) {
       return res.status(400).json({ status: 'ERROR', message: 'No active OTP request found or code expired.' });
     }
 
     if (Date.now() > record.expiresAt) {
-      otpStore.delete(key);
+      await otpPersistenceService.burnOtp(key);
       return res.status(400).json({ status: 'ERROR', message: 'OTP code has expired. Please request a new code.' });
     }
 
     if (record.attempts >= record.maxAttempts) {
-      otpStore.delete(key);
+      await otpPersistenceService.burnOtp(key);
       return res.status(429).json({ status: 'ERROR', message: 'Maximum verification attempts exceeded. Please request a new OTP.' });
     }
 
     const providedHash = hashSecret(otp.trim());
     if (record.otpHash !== providedHash) {
-      record.attempts += 1;
-      return res.status(400).json({ status: 'ERROR', message: `Invalid verification code. ${record.maxAttempts - record.attempts} attempts remaining.` });
+      const attempts = await otpPersistenceService.incrementAttempts(key);
+      const remaining = Math.max(0, record.maxAttempts - attempts);
+      return res.status(400).json({ status: 'ERROR', message: `Invalid verification code. ${remaining} attempts remaining.` });
     }
 
-    // Success: Burn OTP challenge immediately
-    otpStore.delete(key);
+    // Success: Burn OTP challenge immediately (ARCH-03 single-use enforcement)
+    await otpPersistenceService.burnOtp(key);
     await confirmUserEmail(key);
 
     // Single-use short-lived Password Reset Authorization Token (Valid for 15 mins)
     const resetToken = jwt.sign({ email: key, scope: 'password_reset' }, JWT_SECRET, { expiresIn: '15m' });
-    resetTokenStore.set(resetToken, { email: key, used: false, expiresAt: Date.now() + 15 * 60 * 1000 });
+    await otpPersistenceService.storeResetToken(resetToken, { email: key, expiresAt: Date.now() + 15 * 60 * 1000 });
 
     res.status(200).json({
       status: 'SUCCESS',
@@ -120,6 +120,12 @@ async function confirmUserEmail(email) {
     const { data: student } = await supabase.from('students').select('id').ilike('email', normalizedEmail).maybeSingle();
     if (student) {
       await supabase.from('students').update({ email_verified: true, account_status: 'ACTIVE' }).eq('id', student.id);
+    }
+    const { data: profile } = await supabase.from('profiles').select('id').ilike('email', normalizedEmail).maybeSingle();
+    if (profile?.id) {
+      try {
+        await supabase.auth.admin.updateUserById(profile.id, { email_confirm: true });
+      } catch (_) {}
     }
     return true;
   } catch (err) {
@@ -149,37 +155,63 @@ router.post('/auth/set-password', authRateLimiter, async (req, res, next) => {
       return res.status(403).json({ status: 'ERROR', message: 'Reset token does not match target account.' });
     }
 
-    // 2. Verify Single-Use Status in Store
-    const tokenRecord = resetTokenStore.get(resetToken);
-    if (!tokenRecord || tokenRecord.used || Date.now() > tokenRecord.expiresAt) {
+    // 2. Verify Single-Use Status in Persistent Store
+    const isTokenValid = await otpPersistenceService.verifyAndConsumeResetToken(resetToken);
+    if (!isTokenValid) {
       return res.status(401).json({ status: 'ERROR', message: 'Password reset token has already been used or expired.' });
     }
 
-    // Burn token immediately
-    tokenRecord.used = true;
-    resetTokenStore.delete(resetToken);
-
     // 3. Perform Authorized Supabase Account Password Update/Creation
-    const { data: matchedProfile } = await supabase.from('profiles').select('id, email').ilike('email', normalizedEmail).maybeSingle();
+    const { data: matchedProfile } = await supabase.from('profiles').select('id, email, full_name, phone').ilike('email', normalizedEmail).maybeSingle();
     let userId;
+    let updateSucceeded = false;
 
     if (matchedProfile && matchedProfile.id) {
-      const { error: updateErr } = await supabase.auth.admin.updateUserById(matchedProfile.id, {
-        password,
-        email_confirm: true,
-        user_metadata: { fullName: fullName || "Student", phone: phone || "", role: "STUDENT" },
-      });
-      if (updateErr) return res.status(400).json({ status: 'ERROR', message: updateErr.message });
-      userId = matchedProfile.id;
-    } else {
+      try {
+        const { data: updateData, error: updateErr } = await supabase.auth.admin.updateUserById(matchedProfile.id, {
+          password,
+          email_confirm: true,
+          user_metadata: { fullName: fullName || matchedProfile.full_name || "Student", phone: phone || matchedProfile.phone || "", role: "STUDENT" },
+        });
+
+        if (!updateErr && updateData?.user) {
+          userId = matchedProfile.id;
+          updateSucceeded = true;
+        }
+      } catch (_) {
+        updateSucceeded = false;
+      }
+    }
+
+    if (!updateSucceeded) {
+      // User does not exist in auth.users yet (e.g. provisioned via manual enrollment) or matchedProfile is missing
+      const targetId = matchedProfile?.id || undefined;
       const { data: createData, error: createErr } = await supabase.auth.admin.createUser({
+        ...(targetId ? { id: targetId } : {}),
         email: normalizedEmail,
         password,
         email_confirm: true,
-        user_metadata: { fullName: fullName || "Student", phone: phone || "", role: "STUDENT" },
+        user_metadata: { fullName: fullName || matchedProfile?.full_name || "Student", phone: phone || matchedProfile?.phone || "", role: "STUDENT" },
       });
-      if (createErr) return res.status(400).json({ status: 'ERROR', message: createErr.message });
-      userId = createData.user?.id;
+
+      if (createErr) {
+        // If createUser failed because email exists in auth.users under a different UUID, update by finding them
+        const { data: listData } = await supabase.auth.admin.listUsers();
+        const existingAuth = listData?.users?.find(u => u.email?.toLowerCase() === normalizedEmail);
+        if (existingAuth) {
+          const { error: fallbackUpdateErr } = await supabase.auth.admin.updateUserById(existingAuth.id, {
+            password,
+            email_confirm: true,
+            user_metadata: { fullName: fullName || matchedProfile?.full_name || "Student", phone: phone || matchedProfile?.phone || "", role: "STUDENT" },
+          });
+          if (fallbackUpdateErr) return res.status(400).json({ status: 'ERROR', message: fallbackUpdateErr.message });
+          userId = existingAuth.id;
+        } else {
+          return res.status(400).json({ status: 'ERROR', message: createErr.message });
+        }
+      } else {
+        userId = createData.user?.id;
+      }
     }
 
     if (userId) {

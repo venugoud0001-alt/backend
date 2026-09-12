@@ -1,8 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const { supabase } = require('../config/supabase');
-const { authenticateJWT, requirePermission } = require('../middleware/auth');
+const { authenticateJWT, optionalAuthenticateJWT, requirePermission } = require('../middleware/auth');
 const progressService = require('../src/modules/progress/progress.service');
+const streakService = require('../src/modules/progress/streak.service');
 
 // 1. Record Video Watch Progress (Phase 6: 90% completion rule, periodic / event-driven)
 router.post('/video/progress', authenticateJWT, async (req, res, next) => {
@@ -134,6 +135,19 @@ router.get('/progress/:enrollmentId', authenticateJWT, async (req, res, next) =>
       return res.status(200).json({ status: 'SUCCESS', enrollmentId, progress: [] });
     }
 
+    const isEnrollmentUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(enrollmentId);
+    if (isEnrollmentUuid) {
+      const { data: enr } = await supabase
+        .from('enrollments')
+        .select('id, student_id')
+        .eq('id', enrollmentId)
+        .maybeSingle();
+
+      if (enr && enr.student_id && enr.student_id !== student.id && req.userRole !== 'ADMIN') {
+        return res.status(403).json({ status: 'ERROR', message: 'Forbidden: Unauthorized access to enrollment progress.' });
+      }
+    }
+
     const { data: progressRecords } = await supabase
       .from('lesson_video_progress')
       .select('*')
@@ -189,11 +203,14 @@ router.put('/progress/:enrollmentId/:moduleId', authenticateJWT, async (req, res
     if (isUuid) {
       const { data: enr } = await supabase
         .from('enrollments')
-        .select('id, course_id')
+        .select('id, course_id, student_id')
         .eq('id', enrollmentId)
         .maybeSingle();
 
       if (enr) {
+        if (enr.student_id && enr.student_id !== student.id && req.userRole !== 'ADMIN') {
+          return res.status(403).json({ status: 'ERROR', message: 'Forbidden: Cannot update progress for another student enrollment.' });
+        }
         resolvedEnrollmentId = enr.id;
         courseId = enr.course_id;
       }
@@ -229,6 +246,28 @@ router.put('/progress/:enrollmentId/:moduleId', authenticateJWT, async (req, res
       status: 'SUCCESS',
       progressRecord: record || upsertData
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ================= Dynamic Student Learning Streak Endpoints =================
+router.get(['/student/learning-streak', '/progress/streak', '/video/learning-streak'], optionalAuthenticateJWT, async (req, res, next) => {
+  try {
+    const queryEmail = req.query?.email || req.headers['x-student-email'] || null;
+    const tzOffset = req.query?.tz ? Number(req.query.tz) : 0;
+    const result = await streakService.getStudentStreak(req.user, queryEmail, tzOffset);
+    return res.status(200).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post(['/student/learning-streak/heartbeat', '/progress/streak/heartbeat'], optionalAuthenticateJWT, async (req, res, next) => {
+  try {
+    const queryEmail = req.body?.email || req.query?.email || req.headers['x-student-email'] || null;
+    const result = await streakService.recordHeartbeat(req.user, { ...(req.body || {}), email: queryEmail });
+    return res.status(200).json(result);
   } catch (err) {
     next(err);
   }

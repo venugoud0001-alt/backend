@@ -1,5 +1,6 @@
 /**
  * Role-Based Access Control (RBAC) & Audit Logging Service
+ * Hardened for Finding 9: Explicit Fail-Closed Semantics and Removal of In-Memory Sub-User Store.
  */
 
 const { supabase } = require('../../config/supabase');
@@ -12,8 +13,7 @@ const SUPER_ADMIN_EMAILS = [
   (env.SUPER_ADMIN_EMAIL || '').toLowerCase().trim()
 ].filter(Boolean);
 
-// In-Memory Resilient Cache for Sub-Users & Audit Trail
-const memorySubUserStore = new Map();
+// In-Memory Ring Buffer for Audit Trail (Log display only, NEVER used for authorization)
 const memoryAuditLogStore = [];
 
 class RbacService {
@@ -28,6 +28,8 @@ class RbacService {
 
   /**
    * 1. Resolve User Role and Granular Permissions
+   * FAIL-CLOSED: If the database is unreachable or queries fail, it throws an error
+   * or denies administrative access. It NEVER falls back to an in-memory admin store.
    */
   async getUserRoleAndPermissions(user) {
     if (!user || !user.email) {
@@ -41,7 +43,7 @@ class RbacService {
 
     const email = String(user.email).toLowerCase().trim();
 
-    // 1. Check if SUPER_ADMIN
+    // 1. Check if SUPER_ADMIN (Explicit whitelist or explicit super_admin role)
     if (this.isSuperAdminEmail(email) || user.role === ROLES.SUPER_ADMIN || user.user_metadata?.role === ROLES.SUPER_ADMIN) {
       return {
         userId: user.id || 'super-admin-root',
@@ -54,57 +56,42 @@ class RbacService {
       };
     }
 
-    // 2. Check if Delegated ADMIN (sub_users table)
+    // 2. Check if Delegated ADMIN (authoritative sub_users table)
+    let subUser = null;
     try {
-      const { data: subUser, error } = await supabase
+      const { data, error } = await supabase
         .from('sub_users')
         .select('*')
         .ilike('email', email)
         .maybeSingle();
 
-      if (!error && subUser) {
-        // Sync with in-memory cache
-        memorySubUserStore.set(email, subUser);
+      if (error) {
+        console.error(`❌ [RBAC Fail-Closed] Database error fetching sub-user (${email}):`, error.message);
+        throw {
+          statusCode: 503,
+          code: 'RBAC_DB_UNAVAILABLE',
+          message: 'Authorization database service is currently unavailable. Access denied.'
+        };
+      }
+      subUser = data;
+    } catch (dbErr) {
+      if (dbErr.statusCode || dbErr.code === 'RBAC_DB_UNAVAILABLE') {
+        throw dbErr;
+      }
+      console.error(`❌ [RBAC Fail-Closed] Exception querying sub_user (${email}):`, dbErr.message || dbErr);
+      throw {
+        statusCode: 503,
+        code: 'RBAC_DB_UNAVAILABLE',
+        message: 'Authorization database service error. Access denied.'
+      };
+    }
 
-        if (subUser.status === 'Disabled') {
-          return {
-            userId: subUser.id,
-            email,
-            name: subUser.name,
-            role: ROLES.ADMIN,
-            permissions: [],
-            isSuperAdmin: false,
-            status: 'Disabled'
-          };
-        }
-
-        const assignedPerms = Array.isArray(subUser.permissions)
-          ? subUser.permissions
-          : (subUser.permissions ? JSON.parse(subUser.permissions) : []);
-
+    if (subUser) {
+      if (subUser.status === 'Disabled') {
         return {
           userId: subUser.id,
           email,
           name: subUser.name,
-          role: ROLES.ADMIN,
-          permissions: assignedPerms,
-          isSuperAdmin: false,
-          status: subUser.status || 'Active',
-          designation: subUser.designation
-        };
-      }
-    } catch (e) {
-      // Fall through to memory store if DB is connecting
-    }
-
-    // Check memory store for sub-users
-    const cachedSub = memorySubUserStore.get(email);
-    if (cachedSub) {
-      if (cachedSub.status === 'Disabled') {
-        return {
-          userId: cachedSub.id,
-          email,
-          name: cachedSub.name,
           role: ROLES.ADMIN,
           permissions: [],
           isSuperAdmin: false,
@@ -112,19 +99,23 @@ class RbacService {
         };
       }
 
+      const assignedPerms = Array.isArray(subUser.permissions)
+        ? subUser.permissions
+        : (subUser.permissions ? JSON.parse(subUser.permissions) : []);
+
       return {
-        userId: cachedSub.id,
+        userId: subUser.id,
         email,
-        name: cachedSub.name,
+        name: subUser.name,
         role: ROLES.ADMIN,
-        permissions: cachedSub.permissions || [],
+        permissions: assignedPerms,
         isSuperAdmin: false,
-        status: cachedSub.status || 'Active',
-        designation: cachedSub.designation
+        status: subUser.status || 'Active',
+        designation: subUser.designation
       };
     }
 
-    // 3. Fallback to STUDENT
+    // 3. User not found in sub_users and not super admin -> Standard STUDENT
     return {
       userId: user.id || 'student-user',
       email,
@@ -151,6 +142,8 @@ class RbacService {
 
   /**
    * 3. Create Sub-Admin (SUPER_ADMIN ONLY)
+   * FAIL-CLOSED: Persists strictly to database. If database fails, throws error.
+   * NEVER creates an in-memory fallback user.
    */
   async createSubAdmin(actorUser, { name, email, designation, permissions = [], status = 'Active', password }) {
     const actorRbac = await this.getUserRoleAndPermissions(actorUser);
@@ -187,24 +180,17 @@ class RbacService {
       updated_at: new Date().toISOString()
     };
 
-    let createdRecord = null;
-    try {
-      const { data, error } = await supabase
-        .from('sub_users')
-        .insert([newSubUser])
-        .select()
-        .single();
+    const { data: createdRecord, error } = await supabase
+      .from('sub_users')
+      .insert([newSubUser])
+      .select()
+      .single();
 
-      if (!error && data) {
-        createdRecord = data;
-      }
-    } catch (e) {}
-
-    if (!createdRecord) {
-      createdRecord = {
-        id: `sub_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        ...newSubUser,
-        created_at: new Date().toISOString()
+    if (error || !createdRecord) {
+      console.error('❌ [RBAC] Database error creating sub-admin:', error?.message);
+      throw {
+        statusCode: 500,
+        message: `Failed to persist sub-admin in database: ${error?.message || 'Database insert failed'}`
       };
     }
 
@@ -233,9 +219,6 @@ class RbacService {
       }
     }
 
-    // Sync memory store
-    memorySubUserStore.set(cleanEmail, createdRecord);
-
     // Audit Logging
     await this.logAuditEvent({
       actor: actorRbac,
@@ -254,6 +237,7 @@ class RbacService {
 
   /**
    * 4. Update Sub-Admin & Permissions (SUPER_ADMIN ONLY)
+   * FAIL-CLOSED: Persists strictly to database. Zero in-memory fallback.
    */
   async updateSubAdmin(actorUser, subUserId, { name, designation, permissions, status }) {
     const actorRbac = await this.getUserRoleAndPermissions(actorUser);
@@ -274,34 +258,19 @@ class RbacService {
       updates.permissions = permissions.filter(p => validPerms.includes(p));
     }
 
-    let updatedRecord = null;
-    try {
-      const { data, error } = await supabase
-        .from('sub_users')
-        .update(updates)
-        .eq('id', subUserId)
-        .select()
-        .single();
+    const { data: updatedRecord, error } = await supabase
+      .from('sub_users')
+      .update(updates)
+      .eq('id', subUserId)
+      .select()
+      .single();
 
-      if (!error && data) {
-        updatedRecord = data;
-        memorySubUserStore.set(data.email.toLowerCase().trim(), data);
-      }
-    } catch (e) {}
-
-    if (!updatedRecord) {
-      // Find in memory store
-      for (const [k, v] of memorySubUserStore.entries()) {
-        if (String(v.id) === String(subUserId)) {
-          updatedRecord = { ...v, ...updates };
-          memorySubUserStore.set(k, updatedRecord);
-          break;
-        }
-      }
-    }
-
-    if (!updatedRecord) {
-      throw { statusCode: 404, message: 'Sub-admin record not found.' };
+    if (error || !updatedRecord) {
+      console.error('❌ [RBAC] Database error updating sub-admin:', error?.message);
+      throw {
+        statusCode: error ? 500 : 404,
+        message: error ? `Failed to update sub-admin: ${error.message}` : 'Sub-admin record not found.'
+      };
     }
 
     // Audit Logging
@@ -331,32 +300,27 @@ class RbacService {
       };
     }
 
-    let targetEmail = '';
-    for (const [k, v] of memorySubUserStore.entries()) {
-      if (String(v.id) === String(subUserId)) {
-        targetEmail = k;
-        break;
-      }
+    const { data: rec, error: fetchErr } = await supabase
+      .from('sub_users')
+      .select('email')
+      .eq('id', subUserId)
+      .maybeSingle();
+
+    if (fetchErr) {
+      throw { statusCode: 500, message: `Database error finding sub-admin: ${fetchErr.message}` };
     }
 
-    if (this.isSuperAdminEmail(targetEmail)) {
+    if (rec?.email && this.isSuperAdminEmail(rec.email)) {
       throw { statusCode: 403, message: 'Cannot deactivate the root Super Administrator account.' };
     }
 
-    try {
-      await supabase
-        .from('sub_users')
-        .update({ status: 'Disabled', updated_at: new Date().toISOString() })
-        .eq('id', subUserId);
-    } catch (e) {}
+    const { error: updateErr } = await supabase
+      .from('sub_users')
+      .update({ status: 'Disabled', updated_at: new Date().toISOString() })
+      .eq('id', subUserId);
 
-    // Update memory
-    for (const [k, v] of memorySubUserStore.entries()) {
-      if (String(v.id) === String(subUserId)) {
-        v.status = 'Disabled';
-        memorySubUserStore.set(k, v);
-        break;
-      }
+    if (updateErr) {
+      throw { statusCode: 500, message: `Failed to deactivate sub-admin: ${updateErr.message}` };
     }
 
     // Audit Logging
@@ -383,59 +347,45 @@ class RbacService {
       };
     }
 
-    let targetEmail = '';
-    for (const [k, v] of memorySubUserStore.entries()) {
-      if (String(v.id) === String(subUserId)) {
-        targetEmail = k;
-        break;
-      }
+    const { data: rec, error: getErr } = await supabase
+      .from('sub_users')
+      .select('email')
+      .eq('id', subUserId)
+      .maybeSingle();
+
+    if (getErr) {
+      throw { statusCode: 500, message: `Database error finding sub-admin: ${getErr.message}` };
     }
 
-    if (!targetEmail) {
-      try {
-        const { data: rec } = await supabase
-          .from('sub_users')
-          .select('email')
-          .eq('id', subUserId)
-          .maybeSingle();
-        if (rec?.email) targetEmail = rec.email;
-      } catch (e) {}
-    }
+    const targetEmail = rec?.email ? rec.email.toLowerCase().trim() : '';
 
     if (targetEmail && this.isSuperAdminEmail(targetEmail)) {
       throw { statusCode: 403, message: 'Cannot delete the root Super Administrator account.' };
     }
 
-    try {
-      await supabase
-        .from('sub_users')
-        .delete()
-        .eq('id', subUserId);
+    const { error: delErr } = await supabase
+      .from('sub_users')
+      .delete()
+      .eq('id', subUserId);
 
-      if (targetEmail) {
+    if (delErr) {
+      throw { statusCode: 500, message: `Failed to delete sub-admin from database: ${delErr.message}` };
+    }
+
+    if (targetEmail) {
+      try {
         await supabase
           .from('sub_users')
           .delete()
           .ilike('email', targetEmail);
 
-        try {
-          const { data: listRes } = await supabase.auth.admin.listUsers();
-          const authUser = (listRes?.users || []).find(u => u.email?.toLowerCase() === targetEmail.toLowerCase());
-          if (authUser?.id) {
-            await supabase.auth.admin.deleteUser(authUser.id);
-          }
-        } catch (authDelErr) {}
-      }
-    } catch (e) {}
-
-    // Delete from memory store
-    if (targetEmail) {
-      memorySubUserStore.delete(targetEmail);
-    }
-    for (const [k, v] of memorySubUserStore.entries()) {
-      if (String(v.id) === String(subUserId)) {
-        memorySubUserStore.delete(k);
-        break;
+        const { data: listRes } = await supabase.auth.admin.listUsers();
+        const authUser = (listRes?.users || []).find(u => u.email?.toLowerCase() === targetEmail);
+        if (authUser?.id) {
+          await supabase.auth.admin.deleteUser(authUser.id);
+        }
+      } catch (authDelErr) {
+        console.warn('Notice deleting auth user for sub-admin:', authDelErr.message);
       }
     }
 
@@ -453,6 +403,7 @@ class RbacService {
 
   /**
    * 6. List Sub-Admins
+   * FAIL-CLOSED: Reads strictly from database. Zero in-memory store merging.
    */
   async listSubAdmins(actorUser) {
     const actorRbac = await this.getUserRoleAndPermissions(actorUser);
@@ -460,26 +411,17 @@ class RbacService {
       throw { statusCode: 403, message: 'Missing required permission: admin.view' };
     }
 
-    let records = [];
-    try {
-      const { data, error } = await supabase
-        .from('sub_users')
-        .select('*')
-        .order('created_at', { ascending: false });
+    const { data, error } = await supabase
+      .from('sub_users')
+      .select('*')
+      .order('created_at', { ascending: false });
 
-      if (!error && Array.isArray(data)) {
-        records = data;
-      }
-    } catch (e) {}
-
-    // Merge with memory store
-    const map = new Map();
-    records.forEach(r => map.set(r.email.toLowerCase().trim(), r));
-    for (const [k, v] of memorySubUserStore.entries()) {
-      if (!map.has(k)) map.set(k, v);
+    if (error) {
+      console.error('❌ [RBAC] Database error listing sub-admins:', error.message);
+      throw { statusCode: 500, message: `Failed to retrieve sub-admins from database: ${error.message}` };
     }
 
-    return Array.from(map.values()).map(sub => ({
+    return (data || []).map(sub => ({
       id: sub.id,
       name: sub.name,
       email: sub.email,
@@ -506,14 +448,14 @@ class RbacService {
       created_at: new Date().toISOString()
     };
 
-    // Store in ring buffer (keeps last 500 records)
+    // Store in ring buffer (keeps last 500 records for display)
     memoryAuditLogStore.unshift(auditRecord);
     if (memoryAuditLogStore.length > 500) memoryAuditLogStore.pop();
 
     try {
       await supabase.from('audit_logs').insert([auditRecord]);
     } catch (e) {
-      // Resilient fallback
+      // Resilient logging fallback
     }
 
     console.log(`📝 [RBAC Audit Log] ${auditRecord.actor_email} (${auditRecord.actor_role}) executed '${auditRecord.action}' on ${auditRecord.target_resource}:${auditRecord.target_id || ''}`);
