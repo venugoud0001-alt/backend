@@ -6,7 +6,13 @@ class PricingRepository {
    */
   async findCourseByIdOrSlug(idOrSlug) {
     if (!idOrSlug) return null;
-    const clean = String(idOrSlug).trim();
+    let resolved = idOrSlug;
+    if (typeof idOrSlug === 'object' && idOrSlug !== null) {
+      resolved = idOrSlug.courseId || idOrSlug.course_id || idOrSlug.id || idOrSlug.slug;
+    }
+    if (!resolved) return null;
+    const clean = String(resolved).trim();
+    if (clean === '[object Object]' || clean.length === 0) return null;
     const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clean);
 
     let query = supabase.from("courses").select("id, title, slug, price, installment_price, status, is_published");

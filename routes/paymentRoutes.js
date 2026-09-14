@@ -60,7 +60,14 @@ const inFlightCheckoutLocks = new Map();
 // Authoritative Payment Order Creation
 router.post(['/payments/create-enrollment-order', '/payments/create-order'], paymentLimiter, async (req, res, next) => {
   const studentEmail = req.body.email || req.body.studentEmail;
-  const courseId = req.body.courseId || req.body.course_id;
+  let rawCourseId = req.body.courseId || req.body.course_id;
+  if (typeof rawCourseId === 'object' && rawCourseId !== null) {
+    rawCourseId = rawCourseId.id || rawCourseId.courseId || rawCourseId.course_id || rawCourseId.slug;
+  }
+  let courseId = rawCourseId ? String(rawCourseId).trim() : "";
+  if (courseId === '[object Object]') {
+    courseId = "";
+  }
   const lockKey = `${String(studentEmail || '').toLowerCase().trim()}_${courseId}_${req.body.paymentPlan || 'FULL'}`;
 
   if (inFlightCheckoutLocks.has(lockKey)) {
@@ -94,7 +101,11 @@ router.post(['/payments/create-enrollment-order', '/payments/create-order'], pay
 
     // Course Lookup with Resilient Catalog Synchronization
     let course = null;
-    const requestedCourseName = (req.body.courseName || req.body.course_name || req.body.programTitle || "").trim();
+    let rawRequestedName = req.body.courseName || req.body.course_name || req.body.programTitle || "";
+    if (typeof rawRequestedName === 'object' && rawRequestedName !== null) {
+      rawRequestedName = rawRequestedName.title || rawRequestedName.name || "";
+    }
+    const requestedCourseName = String(rawRequestedName).trim().replace(/^\[object\s+Object\]$/i, "");
     const isUuid = courseId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(courseId);
 
     if (isUuid) {
@@ -120,7 +131,7 @@ router.post(['/payments/create-enrollment-order', '/payments/create-order'], pay
     }
 
     if (!course) {
-      const notFoundRes = { status: 'ERROR', message: `Course not found for identifier '${courseId || requestedCourseName}'.` };
+      const notFoundRes = { status: 'ERROR', message: `Course not found for identifier '${courseId || requestedCourseName || 'unknown'}'.` };
       resolveLock(notFoundRes);
       return res.status(404).json(notFoundRes);
     }
@@ -140,11 +151,27 @@ router.post(['/payments/create-enrollment-order', '/payments/create-order'], pay
       }
     }
 
-    const pricing = await pricingService.getPricingForCourse({
-      courseId: course.id,
-      paymentMode: paymentPlan,
-      coupon: validatedCoupon
-    });
+    // Authoritative Server-Side Pricing Calculation
+    let pricing = null;
+    try {
+      const coursePricingData = await pricingService.getPricingForCourse(course.id).catch(() => null);
+      const pricingPlan = coursePricingData?.pricingPlans?.find(p => p.paymentMode === paymentPlan) || coursePricingData?.pricingPlans?.[0] || null;
+
+      pricing = calculateDiscountedPricing({
+        course,
+        pricingPlan,
+        installments: pricingPlan?.phases || [],
+        coupon: validatedCoupon,
+        paymentMode: paymentPlan
+      });
+    } catch (pricingCalcErr) {
+      console.warn("Pricing calculation fallback:", pricingCalcErr.message);
+      pricing = calculateDiscountedPricing({
+        course,
+        coupon: validatedCoupon,
+        paymentMode: paymentPlan
+      });
+    }
 
     const totalCoursePrice = pricing.discountedTotal;
 

@@ -41,7 +41,14 @@ async function validateCourse(courseIdOrSlug) {
     throw new HierarchyValidationError('Course identifier is required.', 400, 'COURSE_ID_REQUIRED');
   }
 
-  const raw = String(courseIdOrSlug).trim();
+  let target = courseIdOrSlug;
+  if (typeof courseIdOrSlug === 'object' && courseIdOrSlug !== null) {
+    target = courseIdOrSlug.courseId || courseIdOrSlug.course_id || courseIdOrSlug.id || courseIdOrSlug.slug;
+  }
+  const raw = String(target || '').trim();
+  if (!raw || raw === '[object Object]') {
+    throw new HierarchyValidationError('Course identifier is required and must be valid.', 400, 'COURSE_ID_REQUIRED');
+  }
   const classification = classifyIdentifier(raw);
 
   if (classification === 'INVALID') {

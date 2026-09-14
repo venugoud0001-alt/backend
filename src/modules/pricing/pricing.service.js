@@ -96,9 +96,18 @@ class PricingService {
    * Get active pricing plans for a published course
    */
   async getPricingForCourse(courseIdOrSlug, activeOnly = true) {
-    const course = await repository.findCourseByIdOrSlug(courseIdOrSlug);
+    let resolvedId = courseIdOrSlug;
+    if (typeof courseIdOrSlug === 'object' && courseIdOrSlug !== null) {
+      resolvedId = courseIdOrSlug.courseId || courseIdOrSlug.course_id || courseIdOrSlug.id || courseIdOrSlug.slug;
+    }
+    const cleanId = String(resolvedId || '').trim();
+    if (!cleanId || cleanId === '[object Object]') {
+      throw { statusCode: 400, message: 'Valid course identifier is required.' };
+    }
+
+    const course = await repository.findCourseByIdOrSlug(cleanId);
     if (!course) {
-      throw { statusCode: 404, message: `Course not found for identifier '${courseIdOrSlug}'.` };
+      throw { statusCode: 404, message: `Course not found for identifier '${cleanId}'.` };
     }
 
     const records = await repository.findPricingByCourseId(course.id, activeOnly);

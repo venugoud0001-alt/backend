@@ -212,18 +212,33 @@ async function createStudentAndEnroll(req, res, next) {
     if (couponCode && String(couponCode).trim().length > 0) {
       try {
         const valResult = await couponService.validateCouponForCourse({
-          code: couponCode,
+          code: String(couponCode).trim().toUpperCase(),
           courseId: coursesFound[0].id,
           paymentMode: paymentPlan
         });
-        if (valResult?.isValid && valResult.coupon) {
-          validatedCoupon = valResult.coupon;
-          if (validatedCoupon.discount_type === 'PERCENTAGE') {
-            discount = Math.round((baseCoursePrice * Number(validatedCoupon.discount_value || 0)) / 100);
+        const isOk = valResult?.valid || valResult?.isValid;
+        const couponObj = valResult?.coupon || valResult;
+        if (isOk && couponObj) {
+          validatedCoupon = couponObj;
+          const discType = (validatedCoupon.discount_type || validatedCoupon.discountType || 'PERCENTAGE').toUpperCase();
+          const discVal = Number(
+            validatedCoupon.discount_value !== undefined
+              ? validatedCoupon.discount_value
+              : (validatedCoupon.discountValue !== undefined ? validatedCoupon.discountValue : (validatedCoupon.discount_amount || 0))
+          );
+          if (discType === 'PERCENTAGE') {
+            discount = Math.round((baseCoursePrice * discVal) / 100);
           } else {
-            discount = Math.round(Number(validatedCoupon.discount_value || 0));
+            discount = Math.round(discVal);
           }
           discount = Math.min(baseCoursePrice, Math.max(0, discount));
+
+          // Increment coupon usage count
+          try {
+            await couponService.incrementUsage(validatedCoupon.id || validatedCoupon.code);
+          } catch (incErr) {
+            logger.warn('[Manual Enrollment] Failed to increment coupon usage:', incErr.message);
+          }
         }
       } catch (cErr) {
         logger.warn('[Manual Enrollment] Coupon check note:', cErr.message);
@@ -509,6 +524,11 @@ async function createStudentAndEnroll(req, res, next) {
     let txnId = `TXN-MAN-${Date.now().toString().slice(-8)}`;
 
     if (amountPaid > 0) {
+      const couponTag = (validatedCoupon && discount > 0)
+        ? ` [Coupon: ${validatedCoupon.code.toUpperCase()} -₹${discount.toLocaleString('en-IN')}]`
+        : '';
+      const methodWithCoupon = `${paymentMethod || 'Cash'}${couponTag}`;
+
       const paymentPayload = {
         txn_id: txnId,
         student_name: studentRecord.full_name || fullName || 'Student',
@@ -519,8 +539,8 @@ async function createStudentAndEnroll(req, res, next) {
         total_course_fee: finalAmount,
         remaining_balance: remainingBalance,
         payment_type: paymentPlan,
-        method: paymentMethod || 'Cash',
-        payment_method: paymentMethod || 'Cash',
+        method: methodWithCoupon,
+        payment_method: methodWithCoupon,
         status: remainingBalance <= 0 ? 'Full Payment Settled' : '1st Installment Settled',
         created_at: nowIso
       };
@@ -574,6 +594,8 @@ async function createStudentAndEnroll(req, res, next) {
           remaining_balance: remainingBalance,
           access_status: finalAccessStatus,
           payment_method: paymentMethod,
+          coupon_code: validatedCoupon ? validatedCoupon.code.toUpperCase() : null,
+          discount_amount: discount,
           txn_id: txnId,
           second_payment_due_at: secondDueAt
         }
@@ -645,6 +667,7 @@ async function createStudentAndEnroll(req, res, next) {
       financials: {
         basePrice: baseCoursePrice,
         discount,
+        couponCode: validatedCoupon ? validatedCoupon.code.toUpperCase() : null,
         finalAmount,
         amountPaid,
         remainingBalance,

@@ -279,12 +279,18 @@ class CourseService {
    */
   async getCourseByIdentifier(identifier, isAdmin = false) {
     if (!identifier) return null;
-    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identifier);
+    let resolved = identifier;
+    if (typeof identifier === 'object' && identifier !== null) {
+      resolved = identifier.courseId || identifier.course_id || identifier.id || identifier.slug;
+    }
+    const clean = String(resolved || '').trim();
+    if (!clean || clean === '[object Object]') return null;
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clean);
     if (isUUID) {
-      const byId = await this.getCourseById(identifier, isAdmin);
+      const byId = await this.getCourseById(clean, isAdmin);
       if (byId) return byId;
     }
-    return this.getCourseBySlug(identifier, isAdmin);
+    return this.getCourseBySlug(clean, isAdmin);
   }
 
   /**

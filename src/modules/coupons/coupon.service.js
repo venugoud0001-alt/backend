@@ -583,6 +583,7 @@ class CouponService {
 
     return {
       valid: true,
+      isValid: true,
       coupon,
       course: {
         id: course.id,
