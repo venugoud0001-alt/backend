@@ -440,24 +440,42 @@ class VideoController {
       const hasTopic = Array.isArray(topicRows) && topicRows.length > 0;
       const hasLesson = Array.isArray(lessonRows) && lessonRows.length > 0;
 
-      // Duplicate MediaConvert Job ID Integrity Check
-      if (hasTopic && hasLesson) {
-        videoSessionService.logSecurityEvent('DUPLICATE_MEDIACONVERT_JOB_ID', {
-          jobId,
-          topicId: topicRows[0].id,
-          lessonId: lessonRows[0].lesson_id,
-          ip: req.ip
-        });
-        console.error(`🚨 [Security Anomaly] Duplicate MediaConvert jobId ${jobId} found in BOTH topics and lesson_videos! Aborting with zero mutations.`);
-        return res.status(409).json({
-          success: false,
-          code: 'DUPLICATE_MEDIACONVERT_JOB_ID',
-          message: 'Data integrity violation: Job ID exists across multiple resource types.'
-        });
-      }
+      // Check if job matches in topics and/or lesson_videos
+      let isTopicJob = false;
+      let storedRecord = null;
 
-      // If unknown job (neither in topics nor lesson_videos)
-      if (!hasTopic && !hasLesson) {
+      if (hasTopic && hasLesson) {
+        // Legitimate Mode 2 topic upload stores jobId in both topics and lesson_videos
+        const isSameTopicAsset = String(topicRows[0].id) === String(lessonRows[0].lesson_id) ||
+                                String(topicRows[0].id) === String(lessonRows[0].topic_id) ||
+                                userMetadata.isTopicJob === 'true' ||
+                                userMetadata.isIndividualTopicVideo === 'true';
+
+        if (isSameTopicAsset) {
+          isTopicJob = true;
+          storedRecord = topicRows[0];
+          console.log(`ℹ️ [MediaConvert Webhook] Mode 2 Topic video verified in both topics and lesson_videos for topic ${storedRecord.id}`);
+        } else {
+          videoSessionService.logSecurityEvent('DUPLICATE_MEDIACONVERT_JOB_ID', {
+            jobId,
+            topicId: topicRows[0].id,
+            lessonId: lessonRows[0].lesson_id,
+            ip: req.ip
+          });
+          console.error(`🚨 [Security Anomaly] Duplicate MediaConvert jobId ${jobId} found in BOTH topics and lesson_videos for different assets! Aborting.`);
+          return res.status(409).json({
+            success: false,
+            code: 'DUPLICATE_MEDIACONVERT_JOB_ID',
+            message: 'Data integrity violation: Job ID exists across multiple distinct resource types.'
+          });
+        }
+      } else if (hasTopic) {
+        isTopicJob = true;
+        storedRecord = topicRows[0];
+      } else if (hasLesson) {
+        isTopicJob = false;
+        storedRecord = lessonRows[0];
+      } else {
         videoSessionService.logSecurityEvent('WEBHOOK_UNKNOWN_JOB', { jobId, ip: req.ip });
         return res.status(404).json({
           success: false,
@@ -465,9 +483,6 @@ class VideoController {
           message: 'No registered video processing job matches the provided jobId.'
         });
       }
-
-      const isTopicJob = hasTopic;
-      const storedRecord = isTopicJob ? topicRows[0] : lessonRows[0];
 
       // ─── STEPS 4, 5, 6, 7: OWNERSHIP & METADATA CONSISTENCY CHECKS ─────────
       // Helper for metadata mismatch rejection
@@ -709,19 +724,162 @@ class VideoController {
 
   /**
    * DELETE /api/topics/:topicId
-   * Admin: Cancels topic MediaConvert job and purges topic HLS files
+   * Admin: Cancels topic MediaConvert job and purges or unassigns topic video
    */
   async deleteTopicVideo(req, res, next) {
     try {
       const { topicId } = req.params;
       const courseId = req.query.courseId || req.query.course_id || req.body?.courseId || req.body?.course_id;
       const moduleId = req.query.moduleId || req.query.module_id || req.body?.moduleId || req.body?.module_id;
-      const result = await videoService.deleteTopicVideo(req.user, { topicId, courseId, moduleId });
+      const videoAssetId = req.query.videoAssetId || req.query.video_asset_id || req.body?.videoAssetId || req.body?.video_asset_id;
+      const forceDelete = req.query.forceDelete === 'true' || req.body?.forceDelete === true;
+      const action = req.query.action || req.body?.action;
+      const result = await videoService.deleteTopicVideo(req.user, { topicId, courseId, moduleId, videoAssetId, forceDelete, action });
       return successResponse(res, result, 200, 'Topic video cleaned up.');
     } catch (err) {
       next(err);
     }
   }
+
+  /**
+   * POST /api/topics/:topicId/remove-from-course
+   * Option A: Removes topic video assignment from course, sets 48-hour deletion grace timer
+   */
+  async removeTopicVideoFromCourse(req, res, next) {
+    try {
+      const { topicId } = req.params;
+      const { courseId, moduleId, videoAssetId } = req.body || {};
+      const result = await videoService.removeTopicVideoFromCourse(req.user, {
+        topicId,
+        courseId,
+        moduleId,
+        videoAssetId
+      });
+      return successResponse(res, result, 200, 'Topic video removed from course. Stored file will be deleted after 48 hours if unused.');
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * POST /api/topics/:topicId/delete-permanently
+   * Option B: Explicit permanent deletion of topic video from AWS S3
+   */
+  async deleteTopicVideoPermanently(req, res, next) {
+    try {
+      const { topicId } = req.params;
+      const { courseId, moduleId, videoAssetId, forceDelete } = req.body || {};
+      const result = await videoService.deleteTopicVideoPermanently(req.user, {
+        topicId,
+        courseId,
+        moduleId,
+        videoAssetId,
+        forceDelete: forceDelete ?? true
+      });
+      return successResponse(res, result, 200, 'Topic video permanently deleted from AWS S3 and course curriculum.');
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * POST /api/topics/:topicId/upload-url
+   * Authenticated Admin: Generates S3 direct presigned upload URL for a single topic
+   */
+  async requestTopicUploadUrl(req, res, next) {
+    try {
+      const { topicId } = req.params;
+      const { courseId, moduleId, fileName, contentType, fileSizeBytes, title, durationSeconds } = req.body || {};
+      const result = await videoService.requestTopicUpload(req.user, {
+        topicId,
+        courseId,
+        moduleId,
+        fileName,
+        contentType,
+        fileSizeBytes,
+        title,
+        durationSeconds
+      });
+      return successResponse(res, result, 201, 'Topic presigned S3 direct upload URL generated successfully.');
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * POST /api/topics/:topicId/multipart/initiate
+   * Authenticated Admin: Initializes S3 multipart upload for a single topic
+   */
+  async initiateTopicMultipartUpload(req, res, next) {
+    try {
+      const { topicId } = req.params;
+      const { courseId, moduleId, fileName, contentType, fileSizeBytes, title, partSizeBytes, durationSeconds } = req.body || {};
+      const result = await videoService.initiateTopicMultipartUpload(req.user, {
+        topicId,
+        courseId,
+        moduleId,
+        fileName,
+        contentType,
+        fileSizeBytes,
+        title,
+        partSizeBytes,
+        durationSeconds
+      });
+      return successResponse(res, result, 201, 'Topic S3 multipart upload initialized successfully.');
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * POST /api/topics/:topicId/multipart/complete
+   * Authenticated Admin: Completes S3 multipart upload for a topic and dispatches MediaConvert
+   */
+  async completeTopicMultipartUpload(req, res, next) {
+    try {
+      const { topicId } = req.params;
+      const { videoAssetId, uploadId, s3Key, parts, durationSeconds, courseId, moduleId } = req.body || {};
+      if (!videoAssetId || !parts || !Array.isArray(parts)) {
+        return errorResponse(res, 'videoAssetId and parts array are required.', 400);
+      }
+      const result = await videoService.completeTopicMultipartUploadAndStartProcessing(req.user, {
+        topicId,
+        videoAssetId,
+        uploadId,
+        s3Key,
+        parts,
+        durationSeconds,
+        courseId,
+        moduleId
+      });
+      return successResponse(res, result, 200, 'Topic multipart upload completed and MediaConvert transcoding dispatched.');
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * POST /api/topics/:topicId/confirm-upload
+   * Authenticated Admin: Confirms single PUT upload for a topic and dispatches MediaConvert
+   */
+  async confirmTopicUpload(req, res, next) {
+    try {
+      const { topicId } = req.params;
+      const { videoAssetId, s3Key, durationSeconds, courseId, moduleId } = req.body || {};
+      const result = await videoService.confirmTopicUploadAndStartProcessing(req.user, {
+        topicId,
+        videoAssetId,
+        s3Key,
+        durationSeconds,
+        courseId,
+        moduleId
+      });
+      return successResponse(res, result, 200, 'Topic video upload confirmed and MediaConvert transcoding dispatched.');
+    } catch (err) {
+      next(err);
+    }
+  }
+
 
   /**
    * GET /api/video/stream/:courseId/:moduleId/:topicId

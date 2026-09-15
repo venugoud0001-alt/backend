@@ -167,15 +167,28 @@ function extractResourcePrefixFromUrl(masterUrl) {
   }
 }
 
+/**
+ * Builds the S3 source key for direct individual topic uploads
+ * Structure: courses/{courseSlug}/modules/{moduleSlug}/videos/{videoAssetId}/topics/{topicId}/source/{cleanFileName}
+ */
+function buildS3TopicSourceKey(courseSlug, moduleSlug, videoAssetId, topicId, rawFileName) {
+  const cleanVideoId = String(videoAssetId).trim();
+  const cleanTopicId = String(topicId).trim();
+  const cleanFileName = sanitizeS3FileName(rawFileName);
+  return `courses/${courseSlug}/modules/${moduleSlug}/videos/${cleanVideoId}/topics/${cleanTopicId}/source/${cleanFileName}`;
+}
+
 module.exports = {
   generateS3CourseSlug,
   generateS3ModuleSlug,
   sanitizeS3FileName,
   buildS3SourceKey,
   buildS3HlsPrefix,
+  buildS3TopicSourceKey,
   buildS3TopicHlsPrefix,
   buildS3TopicMasterKey,
   extractResourcePrefixFromUrl
 };
+
 
 

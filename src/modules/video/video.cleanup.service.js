@@ -413,6 +413,458 @@ class VideoCleanupService {
   }
 
   /**
+   * 3B. OPTION A (TOPIC): Remove Video from Topic / Course (48-Hour Grace Period)
+   * Unlinks video from specific topic and curriculum, marks UNASSIGNED/PENDING_DELETE with cleanup_after = NOW + 48h.
+   */
+  async unassignTopicVideoWith48HourGrace({ topicId, courseId, moduleId, videoAssetId }) {
+    if (!topicId) {
+      throw new Error('topicId is required to unassign topic video.');
+    }
+
+    const { validateHierarchyChain } = require('../../utils/hierarchyValidator');
+    const videoService = require('./video.service');
+    const mediaConvertVideoService = require('./video.mediaconvert.service');
+
+    let topic = null;
+    if (videoService?.memoryVideoStore) {
+      topic = videoService.memoryVideoStore.get(`topic_${topicId}`);
+    }
+    if (!topic) {
+      const { data: dbTopic } = await supabase.from('topics').select('*').eq('id', topicId).maybeSingle();
+      topic = dbTopic;
+    }
+
+    const effectiveCourseId = courseId || topic?.course_id;
+    const effectiveModuleId = moduleId || topic?.module_id;
+
+    if (effectiveCourseId) {
+      try {
+        await validateHierarchyChain({
+          courseId: effectiveCourseId,
+          moduleId: effectiveModuleId,
+          topicId: topicId,
+          videoId: videoAssetId
+        });
+      } catch (hErr) {
+        console.warn('⚠️ [Video Cleanup] Topic hierarchy notice during unassign:', hErr.message);
+      }
+    }
+
+    const graceHours = CLEANUP_SETTINGS.UNASSIGNED_GRACE_PERIOD_HOURS || 48;
+    const cleanupAfter = new Date(Date.now() + (graceHours * 60 * 60 * 1000)).toISOString();
+
+    try {
+      // Cancel active MediaConvert job if present
+      const activeJobId = topic?.mediaconvert_job_id;
+      if (activeJobId) {
+        try {
+          await mediaConvertVideoService.cancelJob(activeJobId);
+        } catch (e) {}
+      }
+
+      // Locate associated lesson_videos record for this topic's video asset
+      let q = supabase.from('lesson_videos').select('*');
+      if (effectiveCourseId) {
+        const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(effectiveCourseId));
+        if (isUUID) q = q.eq('course_id', effectiveCourseId);
+      }
+      const assetFilters = [];
+      if (videoAssetId) assetFilters.push(`id.eq.${videoAssetId}`);
+      if (topicId) {
+        assetFilters.push(`lesson_id.eq.${topicId}`);
+        assetFilters.push(`topic_id.eq.${topicId}`);
+      }
+      if (topic?.source_video_id) assetFilters.push(`id.eq.${topic.source_video_id}`);
+      if (assetFilters.length > 0) {
+        q = q.or(assetFilters.join(','));
+      }
+
+      const { data: records } = await q;
+      if (Array.isArray(records) && records.length > 0) {
+        for (const rec of records) {
+          await supabase
+            .from('lesson_videos')
+            .update({
+              status: 'UNASSIGNED',
+              cleanup_status: 'PENDING_DELETE',
+              cleanup_after: cleanupAfter,
+              cleanup_reason: 'REMOVED_FROM_TOPIC',
+              hls_master_url: null,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', rec.id);
+
+          this.logCleanupAudit({
+            video_id: rec.id,
+            course_id: effectiveCourseId || rec.course_id,
+            module_id: effectiveModuleId || rec.module_id,
+            object_key: rec.source_s3_key,
+            object_type: 'TOPIC_VIDEO',
+            cleanup_reason: 'REMOVED_FROM_TOPIC',
+            cleanup_status: 'PENDING_DELETE_48H',
+            bytes_reclaimed: 0
+          });
+        }
+      }
+
+      // Reset specific topic row in database
+      try {
+        await supabase
+          .from('topics')
+          .update({
+            processing_status: 'DRAFT',
+            mediaconvert_job_id: null,
+            source_video_id: null,
+            hls_master_url: null,
+            hls_720p_url: null,
+            hls_1080p_url: null,
+            hls_prefix: null,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', topicId);
+      } catch (tDbErr) {
+        console.warn('⚠️ [Video Cleanup] Notice resetting topic in database during unassign:', tDbErr.message);
+      }
+
+      // Clear memory video store for this topic
+      if (videoService?.memoryVideoStore) {
+        videoService.memoryVideoStore.delete(`topic_${topicId}`);
+        if (videoAssetId) videoService.memoryVideoStore.delete(String(videoAssetId));
+        if (topic?.source_video_id) videoService.memoryVideoStore.delete(String(topic.source_video_id));
+      }
+
+      // Unlink topic video in courses.curriculum_modules JSON
+      if (effectiveCourseId) {
+        try {
+          const { data: courseObj } = await supabase
+            .from('courses')
+            .select('id, curriculum_modules')
+            .eq('id', effectiveCourseId)
+            .maybeSingle();
+
+          if (courseObj && Array.isArray(courseObj.curriculum_modules)) {
+            let modified = false;
+            const updatedModules = courseObj.curriculum_modules.map(mod => {
+              const matchesMod = (effectiveModuleId && String(mod.id) === String(effectiveModuleId)) ||
+                                (topic?.module_id && String(mod.id) === String(topic.module_id));
+              if (!matchesMod || !Array.isArray(mod.topics)) return mod;
+
+              const updatedTopics = mod.topics.map(t => {
+                const tId = typeof t === 'object' && t !== null ? t.id : t;
+                const tTitle = typeof t === 'object' && t !== null ? (t.title || t.name) : t;
+                const isMatch = String(tId) === String(topicId) ||
+                                (topic?.title && String(tTitle) === String(topic.title));
+                if (isMatch) {
+                  modified = true;
+                  return {
+                    ...(typeof t === 'object' ? t : { title: t }),
+                    video_url: '',
+                    hls_master_url: null,
+                    source_video_id: null,
+                    video_asset_id: null,
+                    video_status: 'NO_VIDEO',
+                    processing_status: 'DRAFT',
+                    hasVideo: false
+                  };
+                }
+                return t;
+              });
+
+              return { ...mod, topics: updatedTopics };
+            });
+
+            if (modified) {
+              await supabase
+                .from('courses')
+                .update({
+                  curriculum_modules: updatedModules,
+                  updated_at: new Date().toISOString()
+                })
+                .eq('id', courseObj.id);
+            }
+          }
+        } catch (cErr) {
+          console.warn('⚠️ [Video Cleanup] Notice updating course curriculum during topic unassign:', cErr.message);
+        }
+      }
+
+      console.log(`⏱️ [Video Lifecycle] Topic video unassigned for topic ${topicId}. 48-hour deletion grace timer set to: ${cleanupAfter}`);
+      return {
+        success: true,
+        topicId,
+        mode: 'REMOVE_FROM_COURSE',
+        gracePeriodHours: graceHours,
+        cleanupAfter
+      };
+    } catch (err) {
+      console.warn(`⚠️ [Video Cleanup] unassignTopicVideoWith48HourGrace notice:`, err.message);
+      return { success: false, error: err.message };
+    }
+  }
+
+  /**
+   * 3C. OPTION B (TOPIC): Immediate Permanent S3 Purge for Topic Video
+   * Purges all S3 HLS segments, master manifests, raw input files, deletes video asset records, and resets topic.
+   */
+  async deleteTopicVideoPermanentlyWithSafetyCheck({ topicId, courseId, moduleId, videoAssetId, forceDelete = true, s3VideoService, user }) {
+    if (!topicId) {
+      throw new Error('topicId is required to permanently delete topic video.');
+    }
+
+    const { validateHierarchyChain } = require('../../utils/hierarchyValidator');
+    const mediaConvertVideoService = require('./video.mediaconvert.service');
+    const videoService = require('./video.service');
+    const effectiveS3Service = s3VideoService || require('./video.s3.service');
+
+    let topic = null;
+    if (videoService?.memoryVideoStore) {
+      topic = videoService.memoryVideoStore.get(`topic_${topicId}`);
+    }
+    if (!topic) {
+      const { data: dbTopic } = await supabase.from('topics').select('*').eq('id', topicId).maybeSingle();
+      topic = dbTopic;
+    }
+
+    const effectiveCourseId = courseId || topic?.course_id;
+    const effectiveModuleId = moduleId || topic?.module_id;
+
+    if (effectiveCourseId) {
+      try {
+        await validateHierarchyChain({
+          courseId: effectiveCourseId,
+          moduleId: effectiveModuleId,
+          topicId: topicId,
+          videoId: videoAssetId
+        });
+      } catch (hErr) {
+        console.warn('⚠️ [Video Cleanup] Topic hierarchy notice during permanent delete:', hErr.message);
+      }
+    }
+
+    console.log(`\n============================================================`);
+    console.log(`🧹 [TOPIC VIDEO PERMANENT DELETE START] topicId=${topicId} courseId=${effectiveCourseId || 'N/A'} moduleId=${effectiveModuleId || 'N/A'}`);
+    console.log(`------------------------------------------------------------`);
+
+    // 1. Cancel active MediaConvert job if present
+    const activeJobId = topic?.mediaconvert_job_id;
+    if (activeJobId) {
+      console.log(`🛑 [TOPIC MEDIACONVERT CANCEL] jobId=${activeJobId}`);
+      try {
+        await mediaConvertVideoService.cancelJob(activeJobId);
+      } catch (e) {}
+    }
+
+    // 2. Fetch associated lesson_videos record
+    let record = null;
+    try {
+      let q = supabase.from('lesson_videos').select('*');
+      if (effectiveCourseId) {
+        const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(effectiveCourseId));
+        if (isUUID) q = q.eq('course_id', effectiveCourseId);
+      }
+      const assetFilters = [];
+      if (videoAssetId) assetFilters.push(`id.eq.${videoAssetId}`);
+      if (topicId) {
+        assetFilters.push(`lesson_id.eq.${topicId}`);
+        assetFilters.push(`topic_id.eq.${topicId}`);
+      }
+      if (topic?.source_video_id) assetFilters.push(`id.eq.${topic.source_video_id}`);
+      if (assetFilters.length > 0) {
+        q = q.or(assetFilters.join(','));
+      }
+      const { data: records } = await q;
+      if (Array.isArray(records) && records.length > 0) {
+        record = records[0];
+      }
+    } catch (e) {}
+
+    // 3. Abort multipart upload if active on record
+    if (record?.upload_id && record?.source_s3_key) {
+      console.log(`🛑 [TOPIC S3 MULTIPART ABORT] uploadId=${record.upload_id} key=${record.source_s3_key}`);
+      try {
+        await effectiveS3Service.abortMultipartUpload({
+          s3Key: record.source_s3_key,
+          uploadId: record.upload_id
+        });
+      } catch (e) {}
+    }
+
+    // 4. Purge Topic S3 HLS Files & Manifests from Output Bucket
+    const prefixesToPurge = new Set();
+
+    if (topic?.hls_prefix) {
+      prefixesToPurge.add(topic.hls_prefix.endsWith('/') ? topic.hls_prefix : `${topic.hls_prefix}/`);
+    }
+    if (record?.hls_prefix) {
+      prefixesToPurge.add(record.hls_prefix.endsWith('/') ? record.hls_prefix : `${record.hls_prefix}/`);
+    }
+
+    // Extract prefix from master URL if present
+    const hlsUrl = topic?.hls_master_url || record?.hls_master_url;
+    if (hlsUrl) {
+      const cleanHlsKey = hlsUrl.replace(/^https?:\/\/[^\/]+\//, '').replace(/^\/+/, '');
+      if (cleanHlsKey.includes('.m3u8')) {
+        const folder = cleanHlsKey.substring(0, cleanHlsKey.lastIndexOf('/') + 1);
+        if (folder) prefixesToPurge.add(folder);
+      }
+    }
+
+    // Topic namespace prefix
+    if (effectiveCourseId && effectiveModuleId && topicId) {
+      prefixesToPurge.add(`courses/${effectiveCourseId}/modules/${effectiveModuleId}/topics/${topicId}/`);
+    }
+
+    let totalDeletedCount = 0;
+    for (const prefix of prefixesToPurge) {
+      try {
+        console.log(`🔥 [TOPIC S3 PURGE] Purging output prefix: ${prefix}`);
+        const purgeRes = await effectiveS3Service.purgeVideoPrefix({
+          bucket: env.AWS_S3_BUCKET_OUTPUT,
+          prefix: prefix
+        });
+        totalDeletedCount += (purgeRes?.deletedCount || 0);
+      } catch (pErr) {
+        console.warn(`⚠️ [TOPIC S3 PURGE ERROR] Failed prefix ${prefix}:`, pErr.message);
+      }
+    }
+
+    // 5. Purge Raw Source Video from Source/Input Bucket if exists
+    if (record?.source_s3_key) {
+      try {
+        const srcBucket = record.source_s3_bucket || env.AWS_S3_BUCKET_SOURCE;
+        console.log(`🔥 [TOPIC S3 PURGE] Deleting raw source object: ${record.source_s3_key} from bucket ${srcBucket}`);
+        await effectiveS3Service.deleteObject({
+          bucket: srcBucket,
+          key: record.source_s3_key
+        });
+        totalDeletedCount++;
+      } catch (sErr) {
+        console.warn(`⚠️ [TOPIC S3 PURGE ERROR] Failed source key ${record.source_s3_key}:`, sErr.message);
+      }
+    }
+
+    // 6. Delete or mark PURGED in lesson_videos
+    if (record?.id) {
+      try {
+        await supabase
+          .from('lesson_videos')
+          .update({
+            status: 'PURGED',
+            cleanup_status: 'COMPLETED',
+            hls_master_url: null,
+            source_s3_key: null,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', record.id);
+      } catch (e) {}
+    }
+
+    // 7. Reset topic row in topics table
+    try {
+      await supabase
+        .from('topics')
+        .update({
+          processing_status: 'DRAFT',
+          mediaconvert_job_id: null,
+          source_video_id: null,
+          hls_master_url: null,
+          hls_720p_url: null,
+          hls_1080p_url: null,
+          hls_prefix: null,
+          processing_error: null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', topicId);
+    } catch (e) {}
+
+    // 8. Clear memory video store
+    if (videoService?.memoryVideoStore) {
+      videoService.memoryVideoStore.delete(`topic_${topicId}`);
+      if (record?.id) videoService.memoryVideoStore.delete(String(record.id));
+      if (videoAssetId) videoService.memoryVideoStore.delete(String(videoAssetId));
+    }
+
+    // 9. Update courses.curriculum_modules JSON
+    if (effectiveCourseId) {
+      try {
+        const { data: courseObj } = await supabase
+          .from('courses')
+          .select('id, curriculum_modules')
+          .eq('id', effectiveCourseId)
+          .maybeSingle();
+
+        if (courseObj && Array.isArray(courseObj.curriculum_modules)) {
+          let modified = false;
+          const updatedModules = courseObj.curriculum_modules.map(mod => {
+            const matchesMod = (effectiveModuleId && String(mod.id) === String(effectiveModuleId)) ||
+                              (topic?.module_id && String(mod.id) === String(topic.module_id));
+            if (!matchesMod || !Array.isArray(mod.topics)) return mod;
+
+            const updatedTopics = mod.topics.map(t => {
+              const tId = typeof t === 'object' && t !== null ? t.id : t;
+              const tTitle = typeof t === 'object' && t !== null ? (t.title || t.name) : t;
+              const isMatch = String(tId) === String(topicId) ||
+                              (topic?.title && String(tTitle) === String(topic.title));
+              if (isMatch) {
+                modified = true;
+                return {
+                  ...(typeof t === 'object' ? t : { title: t }),
+                  video_url: '',
+                  hls_master_url: null,
+                  source_video_id: null,
+                  video_asset_id: null,
+                  video_status: 'NO_VIDEO',
+                  processing_status: 'DRAFT',
+                  hasVideo: false
+                };
+              }
+              return t;
+            });
+
+            return { ...mod, topics: updatedTopics };
+          });
+
+          if (modified) {
+            await supabase
+              .from('courses')
+              .update({
+                curriculum_modules: updatedModules,
+                updated_at: new Date().toISOString()
+              })
+              .eq('id', courseObj.id);
+          }
+        }
+      } catch (cErr) {
+        console.warn('⚠️ [Video Cleanup] Notice updating course curriculum during permanent topic delete:', cErr.message);
+      }
+    }
+
+    this.logCleanupAudit({
+      video_id: record?.id || videoAssetId || topicId,
+      course_id: effectiveCourseId,
+      module_id: effectiveModuleId,
+      object_key: record?.source_s3_key,
+      object_type: 'TOPIC_VIDEO',
+      cleanup_reason: 'TOPIC_VIDEO_PERMANENT_DELETE',
+      cleanup_status: CLEANUP_STATUS.COMPLETED,
+      bytes_reclaimed: totalDeletedCount,
+      deleted_by: user?.email || user?.id || 'admin'
+    });
+
+    console.log(`✅ [TOPIC VIDEO PERMANENT DELETE COMPLETE] topicId=${topicId} Purged ${totalDeletedCount} objects.`);
+    console.log(`============================================================\n`);
+
+    return {
+      success: true,
+      mode: 'TOPIC_VIDEO_PERMANENT_DELETE',
+      deleted: true,
+      topicId,
+      objectsPurged: totalDeletedCount,
+      message: 'Topic video permanently deleted from AWS S3 and course curriculum.'
+    };
+  }
+
+  /**
    * 4. Safe Video-Scoped Deletion / Cancellation at ANY Lifecycle Stage:
    * (Uploading, Queued, Transcoding, Generating HLS, Validating, READY, FAILED)
    */

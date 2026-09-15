@@ -300,6 +300,59 @@ router.delete(
   videoController.deleteTopicVideo
 );
 
+// T7A. Admin Removes Topic Video from Course (Option A: 48-Hour Grace Period)
+router.post(
+  ['/topics/:topicId/remove-from-course', '/video/topics/:topicId/remove-from-course'],
+  authenticateJWT,
+  requireAnyPermission(['video.upload', 'course.edit', 'curriculum.create', 'curriculum.edit', 'course.create']),
+  videoController.removeTopicVideoFromCourse
+);
+
+// T7B. Admin Permanently Deletes Topic Video from AWS S3 (Option B: Immediate S3 Purge)
+router.post(
+  ['/topics/:topicId/delete-permanently', '/video/topics/:topicId/delete-permanently'],
+  authenticateJWT,
+  requireAnyPermission(['video.upload', 'course.edit', 'curriculum.create', 'curriculum.edit', 'course.create']),
+  videoController.deleteTopicVideoPermanently
+);
+
+// T8. Admin Requests Presigned Direct S3 PUT Upload URL for Single Topic (< 100 MB)
+router.post(
+  ['/topics/:topicId/upload-url', '/video/topics/:topicId/upload-url'],
+  heavyVideoOpsLimiter,
+  authenticateJWT,
+  requireAnyPermission(['video.upload', 'course.edit', 'curriculum.create', 'curriculum.edit', 'course.create']),
+  videoController.requestTopicUploadUrl
+);
+
+// T9. Admin Initiates S3 Multipart Upload for Single Topic (>= 100 MB)
+router.post(
+  ['/topics/:topicId/multipart/initiate', '/video/topics/:topicId/multipart/initiate'],
+  heavyVideoOpsLimiter,
+  authenticateJWT,
+  requireAnyPermission(['video.upload', 'course.edit', 'curriculum.create', 'curriculum.edit', 'course.create']),
+  videoController.initiateTopicMultipartUpload
+);
+
+// T10. Admin Completes S3 Multipart Upload for Single Topic & Starts MediaConvert
+router.post(
+  ['/topics/:topicId/multipart/complete', '/video/topics/:topicId/multipart/complete'],
+  heavyVideoOpsLimiter,
+  authenticateJWT,
+  requireAnyPermission(['video.upload', 'course.edit', 'curriculum.create', 'curriculum.edit', 'course.create']),
+  videoController.completeTopicMultipartUpload
+);
+
+// T11. Admin Confirms Single PUT Upload for Single Topic & Starts MediaConvert
+router.post(
+  ['/topics/:topicId/confirm-upload', '/video/topics/:topicId/confirm-upload'],
+  heavyVideoOpsLimiter,
+  authenticateJWT,
+  requireAnyPermission(['video.upload', 'course.edit', 'curriculum.create', 'curriculum.edit', 'course.create']),
+  videoController.confirmTopicUpload
+);
+
+
 // 6. AWS MediaConvert EventBridge Webhook Callback
 router.post(
   '/video/webhook',
