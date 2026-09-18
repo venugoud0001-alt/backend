@@ -42,6 +42,9 @@ router.post('/auth/send-otp', otpSendLimiter, async (req, res, next) => {
 
     res.status(200).json({ status: 'SUCCESS', message: 'Verification code sent to email.', expiresInSeconds: 600 });
   } catch (err) {
+    if (err?.code === 'EAUTH' || err?.code === 'SMTP_NOT_CONFIGURED') {
+      err.statusCode = err.statusCode || 503;
+    }
     next(err);
   }
 });

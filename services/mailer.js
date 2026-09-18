@@ -39,6 +39,15 @@ async function sendOtpEmail({ to, fullName = "Student", otp, expireMinutes = 10 
     throw new Error("Recipient email and OTP code are required.");
   }
 
+  const user = process.env.SMTP_USER || "";
+  const pass = process.env.SMTP_PASS ? process.env.SMTP_PASS.replace(/\s+/g, "") : "";
+  if (!user || !pass) {
+    const err = new Error("Email service is not configured (SMTP_USER / SMTP_PASS missing on server).");
+    err.statusCode = 503;
+    err.code = "SMTP_NOT_CONFIGURED";
+    throw err;
+  }
+
   const html = getOtpEmailTemplate({ fullName, otp, expireMinutes });
 
   const mailOptions = {
@@ -48,9 +57,23 @@ async function sendOtpEmail({ to, fullName = "Student", otp, expireMinutes = 10 
     html,
   };
 
-  const info = await transporter.sendMail(mailOptions);
-  console.log(`✉️ OTP Email dispatched to ${to} (MessageId: ${info.messageId || "sent"})`);
-  return info;
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    console.log(`✉️ OTP Email dispatched to ${to} (MessageId: ${info.messageId || "sent"})`);
+    return info;
+  } catch (mailErr) {
+    const code = mailErr?.code || mailErr?.responseCode || "SMTP_ERROR";
+    console.error(`❌ OTP Email failed for ${to}:`, code, mailErr?.message || mailErr);
+    const err = new Error(
+      code === "EAUTH"
+        ? "Email service authentication failed. Update SMTP_USER / SMTP_PASS on the production server."
+        : "Failed to send verification email. Please try again shortly."
+    );
+    err.statusCode = 503;
+    err.code = String(code);
+    err.cause = mailErr;
+    throw err;
+  }
 }
 
 /**
