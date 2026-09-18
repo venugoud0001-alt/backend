@@ -165,9 +165,11 @@ class CurriculumController {
     try {
       const { id } = req.params;
       const courseId = req.query.courseId || req.query.course_id || req.body?.courseId || req.body?.course_id;
+      const force = String(req.query.force || req.body?.force || '').toLowerCase() === 'true'
+        || String(req.query.cascade || req.body?.cascade || '').toLowerCase() === 'true';
       console.log('\n============================================================');
-      console.log(` 🧩 [MODULE DELETE DATA FLOW] Deleting Module ID: ${id} (Course ID: ${courseId || 'UNSPECIFIED'})`);
-      const result = await curriculumService.deleteModule(id, courseId);
+      console.log(` 🧩 [MODULE DELETE DATA FLOW] Deleting Module ID: ${id} (Course ID: ${courseId || 'UNSPECIFIED'}, force=${force})`);
+      const result = await curriculumService.deleteModule(id, courseId, { force });
       console.log(` 🧩 [MODULE DELETE DATA FLOW] Deleted Module ID: ${id} successfully.`);
       console.log('============================================================\n');
       return successResponse(res, result, 200, 'Module deleted successfully.');

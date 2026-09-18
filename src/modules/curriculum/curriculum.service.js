@@ -231,17 +231,49 @@ class CurriculumService {
       throw { statusCode: 400, message: 'Course ID or Version ID is required.' };
     }
 
-    const { data: course, error: fetchErr } = await supabase
-      .from('courses')
-      .select('*')
-      .eq('id', courseId)
-      .maybeSingle();
+    const cleanCourseId = String(courseId).trim();
+    const classification = classifyIdentifier(cleanCourseId);
+    let courseQuery = supabase.from('courses').select('*');
+    if (classification === 'UUID') {
+      courseQuery = courseQuery.eq('id', cleanCourseId);
+    } else if (classification !== 'INVALID') {
+      courseQuery = courseQuery.eq('slug', normalizeIdentifier(cleanCourseId, 'SLUG'));
+    } else {
+      courseQuery = courseQuery.eq('id', cleanCourseId);
+    }
+
+    const { data: course, error: fetchErr } = await courseQuery.maybeSingle();
 
     if (fetchErr || !course) {
       throw { statusCode: 404, message: `Course not found: '${courseId}'` };
     }
 
     const existingModules = Array.isArray(course.curriculum_modules) ? [...course.curriculum_modules] : [];
+    const incomingTitle = String(data.title || data.name || '').trim();
+    if (!incomingTitle) {
+      throw { statusCode: 400, message: 'Module title is required.' };
+    }
+
+    const normalizeTitle = (value) => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const incomingKey = normalizeTitle(incomingTitle);
+    const duplicate = existingModules.find((m) => {
+      const existingKey = normalizeTitle(m?.title || m?.name);
+      return existingKey && existingKey === incomingKey;
+    });
+
+    if (duplicate) {
+      throw {
+        statusCode: 409,
+        code: 'MODULE_TITLE_EXISTS',
+        message: `A module titled "${duplicate.title || duplicate.name}" already exists in this course. Edit the existing module instead of creating a duplicate.`,
+        details: {
+          course_id: course.id,
+          existing_module_id: duplicate.id || null,
+          existing_title: duplicate.title || duplicate.name || incomingTitle
+        }
+      };
+    }
+
     const newModuleId = require('crypto').randomUUID();
     const durationMins = Number(data.duration_minutes) || (Number(data.duration_hours) ? Math.round(Number(data.duration_hours) * 60) : 60);
     const durationHrsStr = (durationMins / 60) % 1 === 0 ? `${durationMins / 60} hr${durationMins / 60 === 1 ? '' : 's'}` : `${(durationMins / 60).toFixed(1)} hrs`;
@@ -324,6 +356,28 @@ class CurriculumService {
 
     const updatedModules = [...targetCourse.curriculum_modules];
     const existingMod = updatedModules[targetModuleIndex];
+
+    const nextTitle = String(updateData.title || updateData.name || existingMod.title || existingMod.name || '').trim();
+    if (nextTitle) {
+      const normalizeTitle = (value) => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+      const nextKey = normalizeTitle(nextTitle);
+      const conflicting = updatedModules.find((m, idx) => {
+        if (idx === targetModuleIndex || !m) return false;
+        return normalizeTitle(m.title || m.name) === nextKey;
+      });
+      if (conflicting) {
+        throw {
+          statusCode: 409,
+          code: 'MODULE_TITLE_EXISTS',
+          message: `Another module titled "${conflicting.title || conflicting.name}" already exists in this course. Choose a different name.`,
+          details: {
+            course_id: targetCourse.id,
+            existing_module_id: conflicting.id || null,
+            existing_title: conflicting.title || conflicting.name || nextTitle
+          }
+        };
+      }
+    }
 
     const durationMins = updateData.duration_minutes !== undefined
       ? Number(updateData.duration_minutes)
@@ -533,12 +587,13 @@ class CurriculumService {
     return this.updateModule(id, { display_order: displayOrder });
   }
 
-  async deleteModule(id, courseId = null) {
+  async deleteModule(id, courseId = null, options = {}) {
+    const force = Boolean(options?.force);
     if (!id) {
       throw { statusCode: 400, message: 'Module ID is required.' };
     }
 
-    console.log(`\n[MODULE DELETE AUDIT] Request - moduleId: '${id}', courseId: '${courseId || 'UNSPECIFIED'}'`);
+    console.log(`\n[MODULE DELETE AUDIT] Request - moduleId: '${id}', courseId: '${courseId || 'UNSPECIFIED'}', force=${force}`);
 
     if (!courseId) {
       throw { statusCode: 400, message: 'course_id is required to delete a module. Global module deletion across courses is strictly prohibited.' };
@@ -606,29 +661,35 @@ class CurriculumService {
     const targetModule = targetCourse.curriculum_modules[targetModuleIndex];
     const moduleLessons = Array.isArray(targetModule.lessons) ? targetModule.lessons : [];
     const moduleVideos = Array.isArray(targetModule.videos) ? targetModule.videos : [];
-    const totalChildCount = moduleLessons.length + moduleVideos.length;
+    const moduleTopics = Array.isArray(targetModule.topics) ? targetModule.topics : [];
+    const totalChildCount = moduleLessons.length + moduleVideos.length + moduleTopics.length;
 
     console.log(`[MODULE DELETE AUDIT] Found Target Course: '${targetCourse.title}' (ID: ${targetCourse.id})`);
     console.log(`[MODULE DELETE AUDIT] Found Target Module: '${targetModule.title || targetModule.name}' (ID: ${targetModule.id || 'SYNTHETIC'})`);
     console.log(`[MODULE DELETE AUDIT] curriculum lesson count: ${moduleLessons.length}`);
     console.log(`[MODULE DELETE AUDIT] curriculum video count: ${moduleVideos.length}`);
-    console.log(`[MODULE DELETE AUDIT] database lesson count: ${moduleLessons.length}`);
-    console.log(`[MODULE DELETE AUDIT] database video count: ${moduleVideos.length}`);
+    console.log(`[MODULE DELETE AUDIT] curriculum topic count: ${moduleTopics.length}`);
     console.log(`[MODULE DELETE AUDIT] dependency records count: ${totalChildCount}`);
 
-    if (totalChildCount > 0) {
-      console.log(`[MODULE DELETE AUDIT] REJECTING: Module '${id}' contains ${totalChildCount} child lessons/videos.`);
+    if (totalChildCount > 0 && !force) {
+      console.log(`[MODULE DELETE AUDIT] REJECTING: Module '${id}' contains ${totalChildCount} child lessons/videos/topics.`);
       throw {
         statusCode: 422,
         code: 'MODULE_HAS_LESSONS',
-        message: 'Cannot delete module because it contains lessons/videos. Remove all lessons from this module first.',
+        message: 'Cannot delete module because it contains lessons/topics. Use force=true to permanently delete the module and its children, or remove children first.',
         details: {
           course_id: targetCourse.id,
           module_id: id,
           lesson_count: moduleLessons.length,
-          video_count: moduleVideos.length
+          video_count: moduleVideos.length,
+          topic_count: moduleTopics.length,
+          force_supported: true
         }
       };
+    }
+
+    if (totalChildCount > 0 && force) {
+      console.log(`[MODULE DELETE AUDIT] FORCE CASCADE: Removing module '${id}' with ${totalChildCount} nested children.`);
     }
 
     const updatedModules = targetCourse.curriculum_modules.filter((m, mIdx) => !matchesModule(m, mIdx));
@@ -691,10 +752,13 @@ class CurriculumService {
 
     return {
       success: true,
-      message: 'Module deleted successfully',
+      message: force && totalChildCount > 0
+        ? 'Module and nested lessons/topics deleted successfully'
+        : 'Module deleted successfully',
       module_id: id,
       course_id: targetCourse.id,
-      remaining_module_count: updatedModules.length
+      remaining_module_count: updatedModules.length,
+      cascaded_children: force ? totalChildCount : 0
     };
   }
 
