@@ -2,6 +2,7 @@ const { supabase } = require('../../config/supabase');
 const { generateSlug } = require('../../utils/slug');
 const { classifyIdentifier, normalizeIdentifier, isUUID } = require('../../utils/idValidator');
 const courseService = require('../courses/course.service');
+const crypto = require('crypto');
 
 // Helper to safely execute Supabase query catching PGRST205 table cache missing error
 async function safeQuery(queryPromise, fallbackValue = []) {
@@ -20,6 +21,43 @@ async function safeQuery(queryPromise, fallbackValue = []) {
     }
     throw err;
   }
+}
+
+/** Assign a real UUID when curriculum JSON still has mod_1 / missing ids. */
+function ensureStableModuleId(mod) {
+  if (!mod || typeof mod !== 'object') return null;
+  const current = String(mod.id || '').trim();
+  if (isUUID(current)) return current;
+  const nextId = crypto.randomUUID();
+  mod.id = nextId;
+  return nextId;
+}
+
+/** Persist UUID repairs for modules stored without stable ids. */
+async function healCourseModuleIds(course) {
+  if (!course?.id || !Array.isArray(course.curriculum_modules)) return false;
+  let changed = false;
+  const next = course.curriculum_modules.map((m) => {
+    if (!m || typeof m !== 'object') return m;
+    const copy = { ...m };
+    const before = String(copy.id || '').trim();
+    if (!isUUID(before)) {
+      copy.id = crypto.randomUUID();
+      changed = true;
+    }
+    return copy;
+  });
+  if (!changed) return false;
+  const { error } = await supabase
+    .from('courses')
+    .update({
+      curriculum_modules: next,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', course.id);
+  if (error) throw error;
+  course.curriculum_modules = next;
+  return true;
 }
 
 class CurriculumService {
@@ -158,8 +196,13 @@ class CurriculumService {
   async getModulesByVersion(courseIdOrSlug, includeAll = false) {
     const course = await courseService.getCourseBySlug(courseIdOrSlug) || await courseService.getCourseById(courseIdOrSlug);
     if (!course || !Array.isArray(course.curriculum_modules)) return [];
+    try {
+      await healCourseModuleIds(course);
+    } catch (healErr) {
+      console.warn('⚠️ [Modules] Could not heal module UUIDs:', healErr.message || healErr);
+    }
     return course.curriculum_modules.map((mod, idx) => ({
-      id: mod.id || `mod_${idx + 1}`,
+      id: (isUUID(String(mod.id || '').trim()) ? String(mod.id).trim() : (mod.id || `mod_${idx + 1}`)),
       name: mod.name || mod.title || `Module ${idx + 1}`,
       title: mod.title || mod.name || `Module ${idx + 1}`,
       description: mod.description || '',
@@ -262,6 +305,20 @@ class CurriculumService {
     });
 
     if (duplicate) {
+      // Legacy rows may exist without a UUID — repair in place so clients can link instead of recreating.
+      const beforeId = String(duplicate.id || '').trim();
+      if (!isUUID(beforeId)) {
+        ensureStableModuleId(duplicate);
+        const { error: healErr } = await supabase
+          .from('courses')
+          .update({
+            curriculum_modules: existingModules,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', course.id);
+        if (healErr) throw healErr;
+      }
+
       throw {
         statusCode: 409,
         code: 'MODULE_TITLE_EXISTS',
@@ -274,7 +331,7 @@ class CurriculumService {
       };
     }
 
-    const newModuleId = require('crypto').randomUUID();
+    const newModuleId = crypto.randomUUID();
     const durationMins = Number(data.duration_minutes) || (Number(data.duration_hours) ? Math.round(Number(data.duration_hours) * 60) : 60);
     const durationHrsStr = (durationMins / 60) % 1 === 0 ? `${durationMins / 60} hr${durationMins / 60 === 1 ? '' : 's'}` : `${(durationMins / 60).toFixed(1)} hrs`;
 
@@ -1376,6 +1433,12 @@ class CurriculumService {
     }
     if (!course) {
       throw { statusCode: 404, message: 'Course not found or not published.' };
+    }
+
+    try {
+      await healCourseModuleIds(course);
+    } catch (healErr) {
+      console.warn('⚠️ [Curriculum Read] Could not heal module UUIDs:', healErr.message || healErr);
     }
 
     // Fetch real uploaded videos and topics for this course to enrich curriculum telemetry
