@@ -17,7 +17,9 @@ function errorHandler(err, req, res, next) {
   // Sanitized message logic to prevent database leak
   let userMessage = err.message || 'An internal server error occurred.';
   const appCode = typeof err.code === 'string' ? err.code : null;
-  const isAppBusinessCode = Boolean(appCode && /^(COURSE_|PAYMENT_|AUTH_|ENROLLMENT_)/i.test(appCode));
+  const isAppBusinessCode = Boolean(
+    appCode && /^(COURSE_|PAYMENT_|AUTH_|ENROLLMENT_|MODULE_)/i.test(appCode)
+  );
   const isPostgresCode = Boolean(err.code && /^[0-9A-Z]{5}$/.test(String(err.code)) && String(err.code).startsWith('23'));
 
   // Mask database / Supabase / Postgres error messages (never mask LMS business codes)
@@ -44,7 +46,9 @@ function errorHandler(err, req, res, next) {
   }
 
   // Preserve LMS business fields so clients can distinguish SUSPENDED vs NOT_ENROLLED
-  const details = {};
+  const details = {
+    ...(err.details && typeof err.details === 'object' ? err.details : {})
+  };
   if (err.field) details.field = err.field;
   if (appCode) details.code = appCode;
   if (err.suspension_reason) details.suspension_reason = err.suspension_reason;
