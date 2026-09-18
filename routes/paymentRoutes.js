@@ -1207,6 +1207,50 @@ router.post('/admin/enrollments/:id/restore', authenticateJWT, requireAdminRole,
   }
 });
 
+// Admin Manual Due Coverage (Cash / UPI / Bank / offline settlement)
+router.post(['/admin/enrollments/:id/cover-due', '/admin/enrollments/:id/manual-settle'], authenticateJWT, requireAdminRole, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const {
+      amount = null,
+      method = 'Cash',
+      transactionRef = '',
+      notes = ''
+    } = req.body || {};
+    const adminEmail = req.user?.email || 'admin@internnetra.com';
+    const adminId = req.user?.id || null;
+
+    const result = await installmentService.manualCoverDue({
+      enrollmentId: id,
+      amount,
+      method,
+      transactionRef,
+      notes,
+      adminEmail,
+      adminId
+    });
+
+    if (result.alreadySettled) {
+      return res.status(200).json({
+        status: 'SUCCESS',
+        message: 'Enrollment is already fully paid. No due remains.',
+        ...result
+      });
+    }
+
+    const remaining = Number(result.remainingDue || 0);
+    res.status(200).json({
+      status: 'SUCCESS',
+      message: remaining <= 0
+        ? 'Manual due coverage recorded. Enrollment marked fully paid and access restored (unless admin hold).'
+        : `Manual payment of ₹${Number(result.coveredAmount || 0).toLocaleString('en-IN')} recorded. Remaining due: ₹${remaining.toLocaleString('en-IN')}.`,
+      ...result
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Admin Installment Ledger with Full Due Date & Suspension Details
 router.get(['/admin/enrollments/installments-ledger', '/admin/installment-ledger'], authenticateJWT, requireAdminRole, async (req, res, next) => {
   try {

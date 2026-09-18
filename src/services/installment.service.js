@@ -580,10 +580,178 @@ class InstallmentService {
 
         return { status: 'FULLY_PAID', accessStatus: newAccessStatus, restored: Boolean(restoredAt) };
       }
+
+      // ADDITIONAL PARTIAL PAYMENT (first installment already paid, still not fully settled)
+      if (!isFullySettled && newPaid > currentPaid) {
+        const updateData = {
+          payment_status: 'PARTIALLY_PAID',
+          amount_paid: newPaid,
+          amount_pending: newPending,
+          updated_at: nowIso
+        };
+
+        await supabase.from('enrollments').update(updateData).eq('id', enrollmentId);
+
+        await this.logAuditEvent({
+          action: 'PARTIAL_INSTALLMENT_PAID',
+          targetId: enrollmentId,
+          details: { amount_paid: newPaid, amount_pending: newPending, txn_id: txnId }
+        });
+
+        return { status: 'PARTIAL_SETTLEMENT', newPaid, newPending };
+      }
+
+      return { status: 'NO_CHANGE', newPaid: currentPaid, newPending: Math.max(0, totalFee - currentPaid) };
     } catch (err) {
       logger.error('[InstallmentService] handlePaymentSettlement error:', err);
       return null;
     }
+  }
+
+  /**
+   * Admin manual due coverage (cash / UPI / bank / offline settlement).
+   * Writes a payments ledger row, settles enrollment balances, and restores
+   * PAYMENT_OVERDUE suspensions when the remaining due is fully cleared.
+   */
+  async manualCoverDue({
+    enrollmentId,
+    amount = null,
+    method = 'Cash',
+    transactionRef = '',
+    notes = '',
+    adminEmail = 'admin@internnetra.com',
+    adminId = null
+  }) {
+    if (!enrollmentId) throw new Error('enrollmentId is required.');
+
+    const { data: enrollment, error } = await supabase
+      .from('enrollments')
+      .select('*, students(full_name, email, phone)')
+      .eq('id', enrollmentId)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!enrollment) throw new Error('Enrollment not found.');
+
+    const totalFee = Number(enrollment.total_amount || 0);
+    const currentPaid = Number(enrollment.amount_paid || 0);
+    const currentPending = Number(
+      enrollment.amount_pending ?? Math.max(0, totalFee - currentPaid)
+    );
+
+    if (currentPending <= 0) {
+      return {
+        alreadySettled: true,
+        enrollment,
+        settlement: { status: 'FULLY_PAID', accessStatus: enrollment.course_access_status }
+      };
+    }
+
+    const coverAmount = Math.min(
+      currentPending,
+      Math.max(0, Number(amount != null && amount !== '' ? amount : currentPending) || 0)
+    );
+
+    if (coverAmount <= 0) {
+      throw new Error('Cover amount must be greater than zero.');
+    }
+
+    const nowIso = new Date().toISOString();
+    const txnId = String(transactionRef || '').trim() || `TXN-CASH-${Date.now().toString().slice(-10)}`;
+    const methodLabel = String(method || 'Cash').trim() || 'Cash';
+    const studentName = enrollment.students?.full_name || 'Student';
+    const studentEmail = enrollment.students?.email || '';
+    const newPaid = Math.min(totalFee, currentPaid + coverAmount);
+    const newPending = Math.max(0, totalFee - newPaid);
+
+    const paymentPayload = {
+      txn_id: txnId,
+      student_name: studentName,
+      email: studentEmail,
+      course_name: enrollment.course_name || 'Program',
+      amount: coverAmount,
+      amount_paid: coverAmount,
+      total_course_fee: totalFee,
+      remaining_balance: newPending,
+      payment_type: enrollment.payment_plan || 'INSTALLMENT',
+      method: `${methodLabel} (Manual Due Coverage)`,
+      payment_method: `${methodLabel} (Manual Due Coverage)`,
+      status: newPending <= 0 ? 'Full Payment Settled' : 'Installment Settled (Manual)',
+      created_at: nowIso
+    };
+
+    let paymentRecord = null;
+    const { data: pData, error: pErr } = await supabase
+      .from('payments')
+      .insert([paymentPayload])
+      .select()
+      .single();
+
+    if (!pErr && pData) {
+      paymentRecord = pData;
+    } else if (pErr) {
+      logger.warn('[InstallmentService] Manual cover payment write note:', pErr.message);
+    }
+
+    try {
+      await supabase.from('orders').insert([{
+        order_id: txnId,
+        cashfree_order_id: txnId,
+        student_id: enrollment.student_id,
+        course_id: enrollment.course_id,
+        enrollment_id: enrollment.id,
+        amount: coverAmount,
+        status: 'PAID',
+        payment_method: methodLabel,
+        created_at: nowIso,
+        updated_at: nowIso,
+        metadata: {
+          source: 'MANUAL_DUE_COVERAGE',
+          admin_email: adminEmail,
+          notes: notes || null
+        }
+      }]);
+    } catch (ordErr) {
+      logger.warn('[InstallmentService] Manual cover order write note:', ordErr.message);
+    }
+
+    const settlement = await this.handlePaymentSettlement({
+      enrollmentId,
+      amountPaid: coverAmount,
+      txnId,
+      isWebhook: false
+    });
+
+    await this.logAuditEvent({
+      actorEmail: adminEmail,
+      actorRole: 'ADMIN',
+      action: 'MANUAL_DUE_COVERAGE',
+      targetId: enrollmentId,
+      details: {
+        admin_id: adminId,
+        amount: coverAmount,
+        method: methodLabel,
+        txn_id: txnId,
+        notes: notes || null,
+        settlement_status: settlement?.status || null,
+        remaining_after: newPending
+      }
+    });
+
+    const { data: refreshed } = await supabase
+      .from('enrollments')
+      .select('*, students(full_name, email, phone)')
+      .eq('id', enrollmentId)
+      .maybeSingle();
+
+    return {
+      alreadySettled: false,
+      enrollment: refreshed || enrollment,
+      payment: paymentRecord,
+      settlement,
+      coveredAmount: coverAmount,
+      remainingDue: Number(refreshed?.amount_pending ?? newPending)
+    };
   }
 
   /**

@@ -2175,7 +2175,7 @@ class VideoService {
       for (const cid of candidateCourseIds) {
         const { data: enr } = await supabase
           .from('enrollments')
-          .select('id, student_id, course_id, course_name, course_access_status, payment_status, access_start_date, access_expiry_date, created_at')
+          .select('id, student_id, course_id, course_name, course_access_status, payment_status, access_start_date, access_expiry_date, created_at, suspension_reason, suspension_notes, amount_pending, amount_paid, total_amount, second_payment_due_at, installment_due_at')
           .eq('student_id', sid)
           .eq('course_id', cid)
           .order('created_at', { ascending: false })
@@ -2195,7 +2195,7 @@ class VideoService {
       for (const sid of candidateStudentIds) {
         const { data: allEnrs } = await supabase
           .from('enrollments')
-          .select('id, student_id, course_id, course_name, course_access_status, payment_status, access_start_date, access_expiry_date, created_at')
+          .select('id, student_id, course_id, course_name, course_access_status, payment_status, access_start_date, access_expiry_date, created_at, suspension_reason, suspension_notes, amount_pending, amount_paid, total_amount, second_payment_due_at, installment_due_at')
           .eq('student_id', sid);
 
         if (Array.isArray(allEnrs) && allEnrs.length > 0) {
@@ -2233,7 +2233,7 @@ class VideoService {
         message: isManual
           ? 'Your course access has been temporarily suspended by an administrator. Please contact support.'
           : 'Your course access is temporarily suspended because the remaining installment is overdue. Please complete the payment to restore access.',
-        suspension_reason: enrollment.suspension_reason || 'PAYMENT_OVERDUE',
+        suspension_reason: enrollment.suspension_reason || (isManual ? 'MANUAL_ADMIN' : 'PAYMENT_OVERDUE'),
         enrollment_id: enrollment.id,
         amount_pending: enrollment.amount_pending || 0,
         second_payment_due_at: enrollment.second_payment_due_at || enrollment.installment_due_at
