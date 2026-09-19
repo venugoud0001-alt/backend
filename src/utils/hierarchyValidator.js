@@ -234,6 +234,29 @@ async function validateModule(courseOrId, moduleOrId) {
   }
 
   if (!matchedMod) {
+    // Topics table is authoritative for Mode 2 — accept module_id that owns topics in this course
+    try {
+      const { data: topicOwned } = await supabase
+        .from('topics')
+        .select('id, module_id')
+        .eq('course_id', canonicalCourseId)
+        .eq('module_id', cleanModId)
+        .limit(1)
+        .maybeSingle();
+      if (topicOwned) {
+        matchedMod = {
+          id: cleanModId,
+          title: 'Module',
+          name: 'Module',
+          topics: [],
+          video_content_mode: 'INDIVIDUAL_TOPIC_VIDEOS'
+        };
+        matchedIndex = -1;
+      }
+    } catch (_) {}
+  }
+
+  if (!matchedMod) {
     throw new HierarchyValidationError(
       `Module '${cleanModId}' does not belong to course '${course.title || course.id}' (${canonicalCourseId}). Hierarchy validation failed.`,
       403,
@@ -636,9 +659,118 @@ function validateUploadConsistency({ course, module, videoId, s3Key, multipartSe
  * Top-level Orchestrator: validateHierarchyChain
  * Validates whatever levels are supplied in the request.
  * Any mismatch fails closed immediately with ZERO side effects.
+ *
+ * Topic-first path: when a real topic UUID is supplied, course/module are
+ * resolved from the topics row so healed curriculum module IDs (or UI lessonId
+ * vs topics.module_id drift) do not 403 legitimate enrolled playback.
  */
 async function validateHierarchyChain({ courseId, moduleId, topicId, videoId, uploadId, s3Key, multipartSession }) {
   let context = {};
+
+  const cleanTopicId = topicId != null ? String(topicId).trim() : '';
+  if (cleanTopicId && isUUID(cleanTopicId)) {
+    try {
+      const { data: dbTopic, error: topicLookupErr } = await supabase
+        .from('topics')
+        .select('*')
+        .eq('id', cleanTopicId)
+        .maybeSingle();
+
+      if (!topicLookupErr && dbTopic) {
+        const topicCourseId = dbTopic.course_id || courseId;
+        if (!topicCourseId) {
+          throw new HierarchyValidationError(
+            `Topic '${cleanTopicId}' has no associated course scope (orphan record).`,
+            403,
+            'HIERARCHY_ORPHAN_RECORD',
+            { topicId: cleanTopicId }
+          );
+        }
+
+        const courseRes = await validateCourse(topicCourseId);
+
+        // Client courseId (UUID or slug) must resolve to the same course as the topic
+        if (courseId) {
+          const clientCourse = await validateCourse(courseId);
+          if (String(clientCourse.canonicalCourseId) !== String(courseRes.canonicalCourseId)) {
+            throw new HierarchyValidationError(
+              `Topic '${cleanTopicId}' belongs to course '${courseRes.canonicalCourseId}', not '${clientCourse.canonicalCourseId}'. Cross-course topic access denied.`,
+              403,
+              'HIERARCHY_TOPIC_MISMATCH',
+              {
+                topicId: cleanTopicId,
+                expectedCourseId: clientCourse.canonicalCourseId,
+                actualCourseId: courseRes.canonicalCourseId
+              }
+            );
+          }
+        }
+
+        const effectiveModuleId = dbTopic.module_id || moduleId;
+        let modRes = null;
+        if (effectiveModuleId) {
+          try {
+            modRes = await validateModule(courseRes.course, effectiveModuleId);
+          } catch (modErr) {
+            // Curriculum JSON may have been healed to a new UUID while topics.module_id
+            // still points at the previous id — keep topic-owned scope if same course.
+            if (dbTopic.module_id && modErr instanceof HierarchyValidationError) {
+              const jsonMod = Array.isArray(courseRes.course.curriculum_modules)
+                ? courseRes.course.curriculum_modules.find((m) => m && String(m.id) === String(dbTopic.module_id))
+                : null;
+              modRes = {
+                canonicalCourseId: courseRes.canonicalCourseId,
+                canonicalModuleId: String(dbTopic.module_id),
+                module: jsonMod || {
+                  id: dbTopic.module_id,
+                  title: 'Module',
+                  name: 'Module',
+                  topics: [],
+                  video_content_mode: 'INDIVIDUAL_TOPIC_VIDEOS'
+                },
+                modIndex: -1,
+                course: courseRes.course
+              };
+            } else {
+              throw modErr;
+            }
+          }
+        }
+
+        context = {
+          ...courseRes,
+          ...(modRes || {}),
+          canonicalTopicId: dbTopic.id,
+          topic: dbTopic
+        };
+
+        if (videoId) {
+          const vidRes = await validateVideo(
+            context.course,
+            context.module || { canonicalModuleId: context.canonicalModuleId, id: context.canonicalModuleId },
+            context.topic,
+            videoId
+          );
+          context = { ...context, ...vidRes };
+        }
+
+        if (s3Key || multipartSession || uploadId) {
+          validateUploadConsistency({
+            course: context.course,
+            module: context.module || { id: context.canonicalModuleId },
+            videoId: context.canonicalVideoId || videoId,
+            s3Key,
+            multipartSession
+          });
+        }
+
+        return context;
+      }
+    } catch (err) {
+      if (err instanceof HierarchyValidationError) throw err;
+      // Fall through to classic path on unexpected lookup errors
+    }
+  }
 
   if (courseId) {
     const courseRes = await validateCourse(courseId);
@@ -669,11 +801,11 @@ async function validateHierarchyChain({ courseId, moduleId, topicId, videoId, up
     context = { ...context, ...vidRes };
   }
 
-  if (s3Key || uploadId || multipartSession) {
+  if (s3Key || multipartSession || uploadId) {
     validateUploadConsistency({
       course: context.course,
       module: context.module,
-      videoId: context.canonicalVideoId,
+      videoId: context.canonicalVideoId || videoId,
       s3Key,
       multipartSession
     });

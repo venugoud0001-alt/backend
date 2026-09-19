@@ -115,12 +115,18 @@ class VideoAnalyticsService {
 
     const canonicalCourseId = canonicalCourse.id;
 
-    // 2. Validate module belongs to course
-    if (!moduleId && moduleId !== 0) {
+    // 2. Validate module belongs to course (soft when topic resolves module)
+    let cleanModuleId = moduleId !== undefined && moduleId !== null ? String(moduleId).trim() : '';
+
+    // Prefer topic's module_id when client moduleId drifts from healed curriculum IDs
+    if (topicRecord?.module_id) {
+      cleanModuleId = String(topicRecord.module_id).trim();
+    }
+
+    if (!cleanModuleId) {
       throw { statusCode: 400, message: 'Invalid or missing moduleId.' };
     }
 
-    const cleanModuleId = String(moduleId).trim();
     let moduleBelongsToCourse = false;
 
     if (Array.isArray(canonicalCourse.curriculum_modules)) {
@@ -145,48 +151,54 @@ class VideoAnalyticsService {
       }
     }
 
-    if (!moduleBelongsToCourse) {
-      throw {
-        statusCode: 400,
-        message: `Module '${cleanModuleId}' does not belong to course '${canonicalCourse.slug || canonicalCourseId}'.`
-      };
+    // Last resort: topic already proven to belong to this course
+    if (!moduleBelongsToCourse && topicRecord && String(topicRecord.course_id) === String(canonicalCourseId)) {
+      moduleBelongsToCourse = true;
     }
 
-    // 3. Validate topic belongs to module and course (if topicId provided)
+    if (!moduleBelongsToCourse && moduleId !== undefined && moduleId !== null) {
+      // Client may have sent UI lessonId; if a topic UUID is present we already
+      // soft-resolved above. Without topic evidence, keep the hard fail.
+      if (!topicRecord) {
+        throw {
+          statusCode: 400,
+          message: `Module '${cleanModuleId}' does not belong to course '${canonicalCourse.slug || canonicalCourseId}'.`
+        };
+      }
+    }
+
+    // 3. Validate topic belongs to course (module mismatch is soft-corrected above)
     if (topicId) {
-      if (!UUID_REGEX.test(topicId)) {
-        throw { statusCode: 400, message: 'Invalid topicId format. Must be a valid UUID.' };
+      const cleanTopicId = String(topicId).trim();
+      if (!UUID_REGEX.test(cleanTopicId)) {
+        // Synthetic curriculum topic ids are not persisted — drop topic scope, keep event
+        return { course: canonicalCourse, canonicalCourseId, topic: null, canonicalModuleId: cleanModuleId };
       }
 
       if (!topicRecord) {
         const { data: topic, error: topicErr } = await supabase
           .from('topics')
           .select('id, course_id, module_id, title')
-          .eq('id', topicId)
+          .eq('id', cleanTopicId)
           .maybeSingle();
 
         if (topicErr || !topic) {
-          throw { statusCode: 404, message: 'Specified topic does not exist.' };
+          // Non-blocking analytics: accept event without topic FK rather than 404 the heartbeat
+          return { course: canonicalCourse, canonicalCourseId, topic: null, canonicalModuleId: cleanModuleId };
         }
         topicRecord = topic;
+        if (topic.module_id) cleanModuleId = String(topic.module_id).trim();
       }
 
       if (topicRecord.course_id && String(topicRecord.course_id) !== String(canonicalCourseId)) {
         throw {
           statusCode: 400,
-          message: `Topic '${topicId}' belongs to course '${topicRecord.course_id}', not '${canonicalCourseId}'.`
-        };
-      }
-
-      if (topicRecord.module_id && String(topicRecord.module_id) !== cleanModuleId) {
-        throw {
-          statusCode: 400,
-          message: `Topic '${topicId}' belongs to module '${topicRecord.module_id}', not '${cleanModuleId}'.`
+          message: `Topic '${cleanTopicId}' belongs to course '${topicRecord.course_id}', not '${canonicalCourseId}'.`
         };
       }
     }
 
-    return { course: canonicalCourse, canonicalCourseId, topic: topicRecord };
+    return { course: canonicalCourse, canonicalCourseId, topic: topicRecord, canonicalModuleId: cleanModuleId };
   }
 
   /**
@@ -271,7 +283,8 @@ class VideoAnalyticsService {
 
     // 4. Validate Course, Module, Topic Relationship
     const { courseId, moduleId, topicId } = payload;
-    const { canonicalCourseId, topic } = await this.validateHierarchy(courseId, moduleId, topicId);
+    const { canonicalCourseId, topic, canonicalModuleId } = await this.validateHierarchy(courseId, moduleId, topicId);
+    const resolvedModuleId = canonicalModuleId || String(moduleId || '').trim();
 
     // 5. Derive Authenticated Student ID (Client student_id strictly ignored)
     const studentId = await this.resolveAuthenticatedStudentId(user);
@@ -314,8 +327,8 @@ class VideoAnalyticsService {
       client_event_id: clientEventId,
       student_id: studentId,
       course_id: canonicalCourseId,
-      module_id: String(moduleId).trim(),
-      lesson_id: payload.lessonId ? String(payload.lessonId).trim() : String(moduleId).trim(),
+      module_id: resolvedModuleId,
+      lesson_id: payload.lessonId ? String(payload.lessonId).trim() : resolvedModuleId,
       topic_id: effectiveTopicId,
       video_id: videoId,
       session_id: sessionId,
