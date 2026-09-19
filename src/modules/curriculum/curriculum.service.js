@@ -1515,6 +1515,41 @@ class CurriculumService {
       return n > 0 && n !== FAKE_TOPIC_DURATION_SECONDS;
     };
 
+    // O(1) indexes — avoid O(topics × videos) scans during formatJsonCurriculum
+    const videosByTopicId = new Map();
+    const videosByLessonId = new Map();
+    const videosById = new Map();
+    const videosByHls = new Map();
+    const topicsByModuleId = new Map();
+    const videosByModuleId = new Map();
+
+    const pushToMultiMap = (map, key, value) => {
+      if (key == null || key === '') return;
+      const k = String(key);
+      const list = map.get(k);
+      if (list) list.push(value);
+      else map.set(k, [value]);
+    };
+
+    for (const v of dbLessonVideos || []) {
+      if (v?.id) videosById.set(String(v.id), v);
+      if (v?.topic_id) pushToMultiMap(videosByTopicId, v.topic_id, v);
+      if (v?.lesson_id) pushToMultiMap(videosByLessonId, v.lesson_id, v);
+      if (v?.hls_master_url) videosByHls.set(String(v.hls_master_url), v);
+      pushToMultiMap(videosByModuleId, v.module_id, v);
+    }
+    for (const t of dbTopics || []) {
+      pushToMultiMap(topicsByModuleId, t.module_id, t);
+    }
+
+    const firstUsableDuration = (candidates) => {
+      if (!candidates || candidates.length === 0) return 0;
+      for (const v of candidates) {
+        if (isUsableDuration(v?.duration_seconds)) return Number(v.duration_seconds);
+      }
+      return 0;
+    };
+
     const findLessonVideoDuration = (mt, jsonTopic = null) => {
       if (!mt && !jsonTopic) return 0;
       const topicId = (!isSyntheticTopicId(mt?.id) ? mt?.id : null)
@@ -1522,15 +1557,22 @@ class CurriculumService {
         || null;
       const sourceVideoId = mt?.source_video_id || mt?.video_asset_id || jsonTopic?.source_video_id || jsonTopic?.video_asset_id || null;
       const hlsUrl = mt?.hls_master_url || jsonTopic?.hls_master_url || null;
-      const videos = dbLessonVideos || [];
-      const match = videos.find((v) => {
-        if (!isUsableDuration(v.duration_seconds)) return false;
-        if (topicId && (String(v.topic_id || '') === String(topicId) || String(v.lesson_id || '') === String(topicId))) return true;
-        if (sourceVideoId && String(v.id) === String(sourceVideoId)) return true;
-        if (hlsUrl && v.hls_master_url && String(v.hls_master_url) === String(hlsUrl)) return true;
-        return false;
-      });
-      return Number(match?.duration_seconds) || 0;
+
+      if (topicId) {
+        const byTopic = firstUsableDuration(videosByTopicId.get(String(topicId)));
+        if (byTopic > 0) return byTopic;
+        const byLesson = firstUsableDuration(videosByLessonId.get(String(topicId)));
+        if (byLesson > 0) return byLesson;
+      }
+      if (sourceVideoId) {
+        const byId = videosById.get(String(sourceVideoId));
+        if (isUsableDuration(byId?.duration_seconds)) return Number(byId.duration_seconds);
+      }
+      if (hlsUrl) {
+        const byHls = videosByHls.get(String(hlsUrl));
+        if (isUsableDuration(byHls?.duration_seconds)) return Number(byHls.duration_seconds);
+      }
+      return 0;
     };
 
     const resolveTopicDurationSeconds = (mt, jsonTopic = null) => {
@@ -1570,14 +1612,24 @@ class CurriculumService {
         const modIdStr = String(m.id || idx + 1);
         const modNumStr = String(idx + 1);
 
-        const matchedVideos = (dbLessonVideos || []).filter(v => 
-          String(v.module_id) === modIdStr || String(v.module_id) === modNumStr || String(v.lesson_id) === modIdStr
-        );
-        const readyVideo = matchedVideos.find(v => 
+        const matchedVideos = [
+          ...(videosByModuleId.get(modIdStr) || []),
+          ...(modNumStr !== modIdStr ? (videosByModuleId.get(modNumStr) || []) : []),
+          ...(videosByLessonId.get(modIdStr) || [])
+        ];
+        // Dedupe if the same video matched via multiple keys
+        const seenVideoIds = new Set();
+        const uniqueMatchedVideos = matchedVideos.filter((v) => {
+          const id = String(v?.id || '');
+          if (!id || seenVideoIds.has(id)) return false;
+          seenVideoIds.add(id);
+          return true;
+        });
+        const readyVideo = uniqueMatchedVideos.find(v => 
           v.status === 'READY' && v.hls_master_url && v.status !== 'FAILED' && v.status !== 'DELETED' && v.status !== 'DELETING' && v.status !== 'UNASSIGNED'
         );
-        const uploadedVideo = matchedVideos.find(v => v.status === 'UPLOADED' || v.status === 'SEGMENTATION_REQUIRED' || v.status === 'SEGMENTATION_CONFIRMED');
-        const processingVideo = matchedVideos.find(v => v.status === 'PROCESSING' || v.status === 'UPLOADING' || v.status === 'TRANSCODING');
+        const uploadedVideo = uniqueMatchedVideos.find(v => v.status === 'UPLOADED' || v.status === 'SEGMENTATION_REQUIRED' || v.status === 'SEGMENTATION_CONFIRMED');
+        const processingVideo = uniqueMatchedVideos.find(v => v.status === 'PROCESSING' || v.status === 'UPLOADING' || v.status === 'TRANSCODING');
 
         const hasDbVideo = Boolean(readyVideo || uploadedVideo || processingVideo);
         const isExplicitlyNoVideo = !hasDbVideo && (
@@ -1586,9 +1638,10 @@ class CurriculumService {
           (m.hasVideo === false && !m.video_url && !m.video_asset_id)
         );
 
-        const matchedTopics = isExplicitlyNoVideo ? [] : (dbTopics || []).filter(t => 
-          String(t.module_id) === modIdStr || String(t.module_id) === modNumStr
-        );
+        const matchedTopics = isExplicitlyNoVideo ? [] : [
+          ...(topicsByModuleId.get(modIdStr) || []),
+          ...(modNumStr !== modIdStr ? (topicsByModuleId.get(modNumStr) || []) : [])
+        ];
         const readyTopicsWithHls = isExplicitlyNoVideo ? [] : matchedTopics.filter(t => 
           t.processing_status === 'READY' && t.hls_master_url
         );
@@ -1856,63 +1909,62 @@ class CurriculumService {
       });
     };
 
-    // 2. Fetch published version
-    const versions = await this.getVersionsByCourse(course.id);
-    const publishedVersion = (versions || []).find(v => v.status === 'PUBLISHED' || v.status === 'ACTIVE') || versions[0];
-
+    // Prefer JSON curriculum_modules (Mode 1/2 production path). Skip relational
+    // version lookup when JSON already has modules — avoids extra DB round-trips.
     let formattedModules = [];
+    let publishedVersion = null;
 
-    if (publishedVersion) {
-      // 3. Fetch published modules for this version
-      const modules = await this.getModulesByVersion(publishedVersion.id, false);
+    if (Array.isArray(course.curriculum_modules) && course.curriculum_modules.length > 0) {
+      formattedModules = formatJsonCurriculum(course.curriculum_modules);
+    } else {
+      const versions = await this.getVersionsByCourse(course.id);
+      publishedVersion = (versions || []).find(v => v.status === 'PUBLISHED' || v.status === 'ACTIVE') || versions[0];
 
-      if (modules && modules.length > 0) {
-        // 4. For each module, fetch published lessons and topics
-        const modulePromises = modules.map(async (mod) => {
-          const lessons = await this.getLessonsByModule(mod.id, false);
-          const moduleDuration = (lessons || []).reduce((sum, lesson) => sum + (Number(lesson.duration_minutes) || 0), 0);
+      if (publishedVersion) {
+        const modules = await this.getModulesByVersion(course.id, false);
 
-          const lessonPromises = (lessons || []).map(async (lesson) => {
-            const topics = await this.getTopicsByLesson(lesson.id);
+        if (modules && modules.length > 0) {
+          const modulePromises = modules.map(async (mod) => {
+            const lessons = await this.getLessonsByModule(mod.id, false);
+            const moduleDuration = (lessons || []).reduce((sum, lesson) => sum + (Number(lesson.duration_minutes) || 0), 0);
+
+            const lessonPromises = (lessons || []).map(async (lesson) => {
+              const topics = await this.getTopicsByLesson(lesson.id);
+              return {
+                id: lesson.id,
+                title: lesson.title,
+                lesson_type: lesson.lesson_type || 'VIDEO',
+                duration_minutes: Number(lesson.duration_minutes) || 0,
+                video_url: lesson.video_url || '',
+                thumbnail_url: lesson.thumbnail_url || '',
+                is_preview: Boolean(lesson.is_preview),
+                topics: (topics || []).map(t => ({
+                  id: t.id,
+                  title: t.title,
+                  display_order: t.display_order
+                }))
+              };
+            });
+
+            const formattedLessons = await Promise.all(lessonPromises);
+
             return {
-              id: lesson.id,
-              title: lesson.title,
-              lesson_type: lesson.lesson_type || 'VIDEO',
-              duration_minutes: Number(lesson.duration_minutes) || 0,
-              video_url: lesson.video_url || '',
-              thumbnail_url: lesson.thumbnail_url || '',
-              is_preview: Boolean(lesson.is_preview),
-              topics: (topics || []).map(t => ({
-                id: t.id,
-                title: t.title,
-                display_order: t.display_order
-              }))
+              id: mod.id,
+              name: mod.name,
+              title: mod.name,
+              description: mod.description,
+              display_order: mod.display_order,
+              duration_minutes: moduleDuration,
+              lessons: formattedLessons
             };
           });
 
-          const formattedLessons = await Promise.all(lessonPromises);
-
-          return {
-            id: mod.id,
-            name: mod.name,
-            title: mod.name,
-            description: mod.description,
-            display_order: mod.display_order,
-            duration_minutes: moduleDuration,
-            lessons: formattedLessons
-          };
-        });
-
-        formattedModules = (await Promise.all(modulePromises)).sort(sortModuleFn);
+          formattedModules = (await Promise.all(modulePromises)).sort(sortModuleFn);
+        }
       }
     }
 
-    // Fall back to JSON curriculum_modules if relational modules are empty
-    if (formattedModules.length === 0 && course.curriculum_modules && course.curriculum_modules.length > 0) {
-      formattedModules = formatJsonCurriculum(course.curriculum_modules);
-    }
-
-    return {
+    const payload = {
       course: {
         id: course.id,
         title: course.title,
@@ -1928,6 +1980,12 @@ class CurriculumService {
         modules: formattedModules
       }
     };
+
+    setCachedPublicCurriculum(cacheKey, payload);
+    if (course.slug) setCachedPublicCurriculum(String(course.slug).trim().toLowerCase(), payload);
+    if (course.id) setCachedPublicCurriculum(String(course.id).trim().toLowerCase(), payload);
+
+    return payload;
   }
 }
 

@@ -32,13 +32,19 @@ class ProgressService {
     }
 
     let { data: course } = await query.maybeSingle();
+    // Soft slug fallback without loading the full course catalog
     if (!course && classification === 'SLUG') {
-      const { data: allCourses } = await supabase.from('courses').select('id, title, slug, curriculum_modules');
-      course = (allCourses || []).find(c => 
-        c.slug === clean || 
+      const normalized = normalizeIdentifier(clean, 'SLUG');
+      const { data: slugHits } = await supabase
+        .from('courses')
+        .select('id, title, slug, curriculum_modules')
+        .ilike('slug', normalized)
+        .limit(5);
+      course = (slugHits || []).find((c) =>
+        c.slug === clean ||
         c.slug?.toLowerCase() === clean.toLowerCase() ||
-        (c.title && c.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '') === clean.toLowerCase())
-      );
+        c.slug?.toLowerCase() === normalized.toLowerCase()
+      ) || null;
     }
     return course || null;
   }
