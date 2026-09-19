@@ -350,11 +350,26 @@ class ProgressService {
       throw { statusCode: 404, message: 'Course not found.' };
     }
 
-    // 2. Fetch Progress Records
-    const { data: dbProgress } = await supabase
-      .from('lesson_video_progress')
-      .select('*')
-      .eq('student_id', student.id);
+    // 2. Fetch Progress Records (scoped to this course — avoid full-table student scan)
+    let dbProgress = [];
+    try {
+      const { data } = await supabase
+        .from('lesson_video_progress')
+        .select('lesson_id, module_id, is_completed, completion_percent, watched_position_seconds, course_id')
+        .eq('student_id', student.id)
+        .eq('course_id', course.id);
+      dbProgress = data || [];
+    } catch (e) {
+      try {
+        const { data } = await supabase
+          .from('lesson_video_progress')
+          .select('lesson_id, module_id, is_completed, completion_percent, watched_position_seconds, course_id')
+          .eq('student_id', student.id);
+        dbProgress = (data || []).filter((p) => !p.course_id || String(p.course_id) === String(course.id));
+      } catch (e2) {
+        dbProgress = [];
+      }
+    }
 
     const progressMap = new Map();
     (dbProgress || []).forEach(p => {
@@ -366,13 +381,23 @@ class ProgressService {
     const topicCompletionsMap = {};
     const topicModuleMap = {};
     try {
-      const { data: topicProgRows } = await supabase
-        .from('topic_video_progress')
-        .select('topic_id, module_id, is_completed, completion_percent, course_id')
-        .eq('student_id', student.id);
+      let topicProgRows = [];
+      try {
+        const { data } = await supabase
+          .from('topic_video_progress')
+          .select('topic_id, module_id, is_completed, completion_percent, course_id')
+          .eq('student_id', student.id)
+          .eq('course_id', course.id);
+        topicProgRows = data || [];
+      } catch (scopedErr) {
+        const { data } = await supabase
+          .from('topic_video_progress')
+          .select('topic_id, module_id, is_completed, completion_percent, course_id')
+          .eq('student_id', student.id);
+        topicProgRows = (data || []).filter((row) => !row.course_id || String(row.course_id) === String(course.id));
+      }
       (topicProgRows || []).forEach((row) => {
         if (!row?.topic_id) return;
-        if (row.course_id && String(row.course_id) !== String(course.id)) return;
         topicCompletionsMap[String(row.topic_id)] = {
           isCompleted: Boolean(row.is_completed),
           completionPercent: Number(row.completion_percent) || 0

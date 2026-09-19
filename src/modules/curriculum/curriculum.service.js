@@ -33,6 +33,24 @@ function ensureStableModuleId(mod) {
   return nextId;
 }
 
+/** Short TTL cache for student public curriculum (avoids repeat heavy enrichment after deploy) */
+const publicCurriculumCache = new Map();
+const PUBLIC_CURRICULUM_TTL_MS = Number(process.env.CURRICULUM_CACHE_TTL_MS) || 90 * 1000;
+
+function getCachedPublicCurriculum(key) {
+  const hit = publicCurriculumCache.get(String(key));
+  if (!hit) return null;
+  if (Date.now() - hit.at > PUBLIC_CURRICULUM_TTL_MS) {
+    publicCurriculumCache.delete(String(key));
+    return null;
+  }
+  return hit.payload;
+}
+
+function setCachedPublicCurriculum(key, payload) {
+  publicCurriculumCache.set(String(key), { at: Date.now(), payload });
+}
+
 /** Persist UUID repairs for modules stored without stable ids. */
 async function healCourseModuleIds(course) {
   if (!course?.id || !Array.isArray(course.curriculum_modules)) return false;
@@ -1425,6 +1443,10 @@ class CurriculumService {
       throw { statusCode: 400, message: 'Course identifier (slug or ID) is required.' };
     }
 
+    const cacheKey = String(identifier).trim().toLowerCase();
+    const cached = getCachedPublicCurriculum(cacheKey);
+    if (cached) return cached;
+
     // 1. Fetch published course by UUID or Slug
     const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identifier);
     let course = isUUID ? await courseService.getCourseById(identifier, false) : null;
@@ -1435,11 +1457,10 @@ class CurriculumService {
       throw { statusCode: 404, message: 'Course not found or not published.' };
     }
 
-    try {
-      await healCourseModuleIds(course);
-    } catch (healErr) {
+    // Never block student reads on heal writes — run in background if needed
+    healCourseModuleIds(course).catch((healErr) => {
       console.warn('⚠️ [Curriculum Read] Could not heal module UUIDs:', healErr.message || healErr);
-    }
+    });
 
     // Fetch real uploaded videos and topics for this course to enrich curriculum telemetry
     let dbLessonVideos = [];
