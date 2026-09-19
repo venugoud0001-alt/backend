@@ -16,10 +16,23 @@ function invalidatePublicCurriculumCacheSafe(course) {
   } catch (_) {}
 }
 
-function pickBestReadyVideo(rows = []) {
-  const ready = (rows || []).filter(
-    (v) => String(v?.status || '').toUpperCase() === 'READY' && v?.hls_master_url
-  );
+function lessonVideoBelongsToTopic(video, topicId) {
+  if (!video || !topicId) return false;
+  const tid = String(topicId);
+  if (video.topic_id && String(video.topic_id) === tid) return true;
+  // Mode 2 rows often store topic UUID in lesson_id with null topic_id
+  if (video.lesson_id && String(video.lesson_id) === tid) {
+    if (!video.topic_id || String(video.topic_id) === tid) return true;
+  }
+  return false;
+}
+
+function pickBestReadyVideo(rows = [], topicId = null) {
+  const ready = (rows || []).filter((v) => {
+    if (String(v?.status || '').toUpperCase() !== 'READY' || !v?.hls_master_url) return false;
+    if (topicId && !lessonVideoBelongsToTopic(v, topicId)) return false;
+    return true;
+  });
   if (!ready.length) return null;
   ready.sort((a, b) => {
     const da = Number(a.duration_seconds) || 0;
@@ -67,7 +80,12 @@ async function syncTopicReadyFromLessonVideos(topicId, options = {}) {
       .select('id, topic_id, lesson_id, status, hls_master_url, hls_prefix, duration_seconds, updated_at')
       .eq('id', options.preferredVideoId)
       .maybeSingle();
-    if (preferred?.hls_master_url && String(preferred.status || '').toUpperCase() === 'READY') {
+    // Strict: never attach another topic's asset to this topic
+    if (
+      preferred?.hls_master_url &&
+      String(preferred.status || '').toUpperCase() === 'READY' &&
+      lessonVideoBelongsToTopic(preferred, cleanTopicId)
+    ) {
       best = preferred;
     }
   }
@@ -85,7 +103,7 @@ async function syncTopicReadyFromLessonVideos(topicId, options = {}) {
     if (videoErr) {
       return { synced: false, topicId: cleanTopicId, reason: videoErr.message };
     }
-    best = pickBestReadyVideo(videos);
+    best = pickBestReadyVideo(videos, cleanTopicId);
   }
 
   if (!best) {
@@ -139,10 +157,8 @@ async function applyTopicReadySync(topic, readyVideo, options = {}) {
 
           const topics = m.topics.map((t) => {
             if (!t || typeof t !== 'object') return t;
-            const match =
-              String(t.id) === String(topic.id) ||
-              (topic.title && String(t.title || t.name || '') === String(topic.title));
-            if (!match) return t;
+            // Strict: only update this topic's JSON row by id (never title-borrow)
+            if (String(t.id) !== String(topic.id)) return t;
             jsonChanged = true;
             return {
               ...t,
@@ -249,15 +265,25 @@ function enrichTopicsWithReadyLessonVideos(topics = [], lessonVideos = []) {
   }
 
   return topics.map((t) => {
-    if (!t || typeof t !== 'object') return t;
-    const keys = [t.id, t.source_video_id, t.video_asset_id].filter(Boolean).map(String);
-    let best = null;
-    for (const key of keys) {
-      best = pickBestReadyVideo(byTopic.get(key)) || pickBestReadyVideo(byLesson.get(key)) || (
-        byId.get(key)?.status === 'READY' && byId.get(key)?.hls_master_url ? byId.get(key) : null
-      );
-      if (best) break;
+    if (!t || typeof t !== 'object' || !t.id) return t;
+    const topicId = String(t.id);
+    // Only this topic's own READY rows — never borrow via shared source_video_id / module asset
+    let best =
+      pickBestReadyVideo(byTopic.get(topicId), topicId) ||
+      pickBestReadyVideo(byLesson.get(topicId), topicId);
+
+    if (!best && t.source_video_id) {
+      const bySource = byId.get(String(t.source_video_id));
+      if (
+        bySource &&
+        String(bySource.status || '').toUpperCase() === 'READY' &&
+        bySource.hls_master_url &&
+        lessonVideoBelongsToTopic(bySource, topicId)
+      ) {
+        best = bySource;
+      }
     }
+
     if (!best) return t;
     if (!topicNeedsReadySync(t, best)) return t;
     const durationSeconds = Number(best.duration_seconds) > 1
@@ -279,5 +305,6 @@ module.exports = {
   syncCourseTopicsReadyFromLessonVideos,
   enrichTopicsWithReadyLessonVideos,
   pickBestReadyVideo,
-  topicNeedsReadySync
+  topicNeedsReadySync,
+  lessonVideoBelongsToTopic
 };

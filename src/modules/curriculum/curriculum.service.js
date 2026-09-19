@@ -1663,30 +1663,65 @@ class CurriculumService {
           seenVideoIds.add(id);
           return true;
         });
-        const readyVideo = uniqueMatchedVideos.find(v => 
-          v.status === 'READY' && v.hls_master_url && v.status !== 'FAILED' && v.status !== 'DELETED' && v.status !== 'DELETING' && v.status !== 'UNASSIGNED'
-        );
-        const uploadedVideo = uniqueMatchedVideos.find(v => v.status === 'UPLOADED' || v.status === 'SEGMENTATION_REQUIRED' || v.status === 'SEGMENTATION_CONFIRMED');
-        const processingVideo = uniqueMatchedVideos.find(v => v.status === 'PROCESSING' || v.status === 'UPLOADING' || v.status === 'TRANSCODING');
 
-        const hasDbVideo = Boolean(readyVideo || uploadedVideo || processingVideo);
-        const isExplicitlyNoVideo = !hasDbVideo && (
-          m.video_status === 'NO_VIDEO' || 
-          m.video_status === 'UNASSIGNED' || 
-          (m.hasVideo === false && !m.video_url && !m.video_asset_id)
-        );
-
-        const matchedTopics = isExplicitlyNoVideo ? [] : [
+        const matchedTopics = [
           ...(topicsByModuleId.get(modIdStr) || []),
           ...(modNumStr !== modIdStr ? (topicsByModuleId.get(modNumStr) || []) : [])
         ];
-        const readyTopicsWithHls = isExplicitlyNoVideo ? [] : matchedTopics.filter(t => 
+        const topicIdSet = new Set(
+          matchedTopics.map((t) => (t?.id != null ? String(t.id) : null)).filter(Boolean)
+        );
+        // Also include JSON curriculum topic ids so Mode 2 ownership is complete
+        if (Array.isArray(m.topics)) {
+          for (const jt of m.topics) {
+            if (jt?.id && !isSyntheticTopicId(jt.id)) topicIdSet.add(String(jt.id));
+          }
+        }
+
+        const isTopicOwnedVideo = (v) => {
+          if (!v) return false;
+          if (v.topic_id && topicIdSet.has(String(v.topic_id))) return true;
+          if (v.lesson_id && topicIdSet.has(String(v.lesson_id))) return true;
+          return false;
+        };
+
+        // Module-level assets only — never promote a Mode 2 topic upload to module.video_url
+        const moduleLevelVideos = uniqueMatchedVideos.filter((v) => !isTopicOwnedVideo(v));
+        const readyVideo = moduleLevelVideos.find(v =>
+          v.status === 'READY' && v.hls_master_url && v.status !== 'FAILED' && v.status !== 'DELETED' && v.status !== 'DELETING' && v.status !== 'UNASSIGNED'
+        );
+        const uploadedVideo = moduleLevelVideos.find(v => v.status === 'UPLOADED' || v.status === 'SEGMENTATION_REQUIRED' || v.status === 'SEGMENTATION_CONFIRMED');
+        const processingVideo = moduleLevelVideos.find(v => v.status === 'PROCESSING' || v.status === 'UPLOADING' || v.status === 'TRANSCODING');
+
+        const hasDbVideo = Boolean(readyVideo || uploadedVideo || processingVideo);
+        const isExplicitlyNoVideo = !hasDbVideo && (
+          m.video_status === 'NO_VIDEO' ||
+          m.video_status === 'UNASSIGNED' ||
+          (m.hasVideo === false && !m.video_url && !m.video_asset_id)
+        );
+
+        const scopedMatchedTopics = isExplicitlyNoVideo ? [] : matchedTopics;
+        const readyTopicsWithHls = isExplicitlyNoVideo ? [] : scopedMatchedTopics.filter(t =>
           t.processing_status === 'READY' && t.hls_master_url
         );
         const hasRealTopicHls = !isExplicitlyNoVideo && (readyTopicsWithHls.length > 0 || (Array.isArray(m.topics) && m.topics.some(t => Boolean(t?.hls_master_url && t?.processing_status === 'READY'))));
 
-        const effectiveHlsUrl = isExplicitlyNoVideo ? '' : (readyVideo?.hls_master_url || readyTopicsWithHls[0]?.hls_master_url || m.video_url || '');
-        const effectiveAssetId = isExplicitlyNoVideo ? null : (readyVideo?.id || uploadedVideo?.id || readyTopicsWithHls[0]?.source_video_id || m.video_asset_id || null);
+        const modeHint = String(m.video_content_mode || '').toUpperCase();
+        const isMode2Module =
+          modeHint === 'INDIVIDUAL_TOPIC_VIDEOS' ||
+          modeHint === 'TOPIC_VIDEOS' ||
+          modeHint === 'MODE_2' ||
+          // Mixed/individual topic uploads without a true module master
+          (hasRealTopicHls && !readyVideo);
+
+        // Mode 2: module must NOT inherit any topic's HLS — empty topics stay "updated soon"
+        const effectiveHlsUrl = (isExplicitlyNoVideo || isMode2Module)
+          ? ''
+          : (readyVideo?.hls_master_url || m.video_url || '');
+        const effectiveAssetId = (isExplicitlyNoVideo || isMode2Module)
+          ? null
+          : (readyVideo?.id || uploadedVideo?.id || m.video_asset_id || null);
+
 
         // If topics have real duration seconds, calculate total runtime
         const totalTopicSecs = readyTopicsWithHls.reduce((sum, t) => sum + (Number(t.duration_seconds) || 0), 0);
@@ -1696,11 +1731,22 @@ class CurriculumService {
 
         const durationHrsStr = (durationMins / 60) % 1 === 0 ? `${durationMins / 60} hr${durationMins / 60 === 1 ? '' : 's'}` : `${(durationMins / 60).toFixed(1)} hrs`;
 
-        const hasVideoAvailable = !isExplicitlyNoVideo && (Boolean(effectiveHlsUrl && effectiveHlsUrl.trim() !== '') || hasRealTopicHls || Boolean(readyVideo) || Boolean(uploadedVideo));
+        const hasVideoAvailable = !isExplicitlyNoVideo && (
+          Boolean(effectiveHlsUrl && effectiveHlsUrl.trim() !== '') ||
+          hasRealTopicHls ||
+          Boolean(readyVideo) ||
+          Boolean(uploadedVideo)
+        );
 
         const videoStatus = isExplicitlyNoVideo
           ? 'NO_VIDEO'
-          : (readyVideo ? 'READY' : (uploadedVideo ? uploadedVideo.status : (processingVideo ? processingVideo.status : (hasVideoAvailable ? 'READY' : (m.video_status || 'NO_VIDEO')))));
+          : (isMode2Module
+            ? (hasRealTopicHls ? 'READY' : (m.video_status || 'NO_VIDEO'))
+            : (readyVideo ? 'READY' : (uploadedVideo ? uploadedVideo.status : (processingVideo ? processingVideo.status : (hasVideoAvailable ? 'READY' : (m.video_status || 'NO_VIDEO'))))));
+
+        const effectiveVideoContentMode = isMode2Module
+          ? 'INDIVIDUAL_TOPIC_VIDEOS'
+          : (m.video_content_mode || 'SINGLE_MODULE_VIDEO');
 
         const rawLessons = Array.isArray(m.lessons) ? m.lessons : [];
         const formattedLessons = rawLessons.map((l, lIdx) => {
@@ -1780,8 +1826,8 @@ class CurriculumService {
 
         if (baseCurriculumTopics.length > 0) {
           const matchedDbTopicIds = new Set();
-          const sortedDbTopics = !isExplicitlyNoVideo && matchedTopics.length > 0
-            ? [...matchedTopics].sort(sortTopicFn)
+          const sortedDbTopics = !isExplicitlyNoVideo && scopedMatchedTopics.length > 0
+            ? [...scopedMatchedTopics].sort(sortTopicFn)
             : [];
 
           mergedTopics = baseCurriculumTopics.map((t, tIdx) => {
@@ -1830,14 +1876,10 @@ class CurriculumService {
               mt?.is_free_preview
             );
 
-            // Heal Mode 2 drift: topics row can stay DRAFT while lesson_videos is READY+HLS
+            // Heal Mode 2 drift: ONLY attach READY HLS that belongs to THIS topic id
             const topicKeyCandidates = [
               !isSyntheticTopicId(mt?.id) ? mt?.id : null,
-              !isSyntheticTopicId(tId) ? tId : null,
-              mt?.source_video_id,
-              mt?.video_asset_id,
-              isObj ? t.source_video_id : null,
-              isObj ? t.video_asset_id : null
+              !isSyntheticTopicId(tId) ? tId : null
             ].filter(Boolean).map(String);
 
             let readyLv = null;
@@ -1847,27 +1889,57 @@ class CurriculumService {
               );
               if (byTopic) { readyLv = byTopic; break; }
               const byLesson = (videosByLessonId.get(key) || []).find(
-                (v) => v.status === 'READY' && v.hls_master_url
+                (v) => v.status === 'READY' && v.hls_master_url && (!v.topic_id || String(v.topic_id) === key)
               );
               if (byLesson) { readyLv = byLesson; break; }
-              const byId = videosById.get(key);
-              if (byId?.status === 'READY' && byId?.hls_master_url) { readyLv = byId; break; }
+            }
+            // source_video_id only if that asset is owned by this topic
+            if (!readyLv) {
+              const sourceKeys = [
+                mt?.source_video_id,
+                mt?.video_asset_id,
+                isObj ? t.source_video_id : null,
+                isObj ? t.video_asset_id : null
+              ].filter(Boolean).map(String);
+              for (const key of sourceKeys) {
+                const byId = videosById.get(key);
+                if (
+                  byId?.status === 'READY' &&
+                  byId?.hls_master_url &&
+                  topicKeyCandidates.some((tid) =>
+                    String(byId.topic_id || '') === tid || String(byId.lesson_id || '') === tid
+                  )
+                ) {
+                  readyLv = byId;
+                  break;
+                }
+              }
             }
 
             const rawStatus = isExplicitlyNoVideo
               ? 'DRAFT'
-              : (mt?.processing_status || (isObj ? t.processing_status : null) || null);
+              : (mt?.processing_status || null);
+            // Mode 2: do not trust curriculum JSON HLS alone (can be polluted from another topic)
             const rawHls = isExplicitlyNoVideo
               ? null
-              : (mt?.hls_master_url || (isObj ? t.hls_master_url : null) || null);
+              : (mt?.hls_master_url || (!isMode2Module && isObj ? t.hls_master_url : null) || null);
+
+            const topicOwnsReady = Boolean(readyLv) || Boolean(
+              rawHls && String(rawStatus || '').toUpperCase() === 'READY'
+            );
+
             const effectiveStatus = (!isExplicitlyNoVideo && readyLv && (!rawHls || String(rawStatus || '').toUpperCase() !== 'READY'))
               ? 'READY'
-              : (rawStatus || (readyLv ? 'READY' : 'DRAFT'));
-            const effectiveHls = rawHls || readyLv?.hls_master_url || null;
-            const effectiveSource = isExplicitlyNoVideo
+              : (isMode2Module && !topicOwnsReady
+                ? 'DRAFT'
+                : (rawStatus || (readyLv ? 'READY' : (isObj && !isMode2Module ? t.processing_status : null) || 'DRAFT')));
+            const effectiveHls = (isMode2Module && !topicOwnsReady)
               ? null
-              : (mt?.source_video_id || mt?.video_asset_id || readyLv?.id || (isObj ? (t.source_video_id || t.video_asset_id) : null) || null);
-            const effectiveDurSec = isExplicitlyNoVideo
+              : (readyLv?.hls_master_url || rawHls || null);
+            const effectiveSource = isExplicitlyNoVideo || (isMode2Module && !topicOwnsReady)
+              ? null
+              : (readyLv?.id || mt?.source_video_id || mt?.video_asset_id || (!isMode2Module && isObj ? (t.source_video_id || t.video_asset_id) : null) || null);
+            const effectiveDurSec = isExplicitlyNoVideo || (isMode2Module && !topicOwnsReady)
               ? 0
               : (durSec > 0 ? durSec : (Number(readyLv?.duration_seconds) || 0));
 
@@ -1882,13 +1954,21 @@ class CurriculumService {
               name: effectiveTitle,
               display_order: tOrder,
               module_id: mt?.module_id || modIdStr,
-              start_time_seconds: isExplicitlyNoVideo ? 0 : (mt?.start_time_seconds ?? (isObj ? (t.start_time_seconds || 0) : 0)),
-              end_time_seconds: isExplicitlyNoVideo ? 0 : (mt?.end_time_seconds ?? (isObj ? (t.end_time_seconds || 0) : 0)),
-              start_timecode: isExplicitlyNoVideo ? '' : (mt?.start_timecode || (isObj ? (t.start_timecode || '') : '')),
-              end_timecode: isExplicitlyNoVideo ? '' : (mt?.end_timecode || (isObj ? (t.end_timecode || '') : '')),
+              start_time_seconds: (isExplicitlyNoVideo || (isMode2Module && !topicOwnsReady))
+                ? 0
+                : (mt?.start_time_seconds ?? (isObj ? (t.start_time_seconds || 0) : 0)),
+              end_time_seconds: (isExplicitlyNoVideo || (isMode2Module && !topicOwnsReady))
+                ? 0
+                : (mt?.end_time_seconds ?? (isObj ? (t.end_time_seconds || 0) : 0)),
+              start_timecode: (isExplicitlyNoVideo || (isMode2Module && !topicOwnsReady))
+                ? ''
+                : (mt?.start_timecode || (isObj ? (t.start_timecode || '') : '')),
+              end_timecode: (isExplicitlyNoVideo || (isMode2Module && !topicOwnsReady))
+                ? ''
+                : (mt?.end_timecode || (isObj ? (t.end_timecode || '') : '')),
               duration_seconds: effectiveDurSec,
-              duration: isExplicitlyNoVideo ? '0s' : formatTopicDurationLabel(effectiveDurSec),
-              duration_minutes: isExplicitlyNoVideo ? 0 : (effectiveDurSec > 0 ? Math.round(effectiveDurSec / 60) : durMins),
+              duration: isExplicitlyNoVideo || (isMode2Module && !topicOwnsReady) ? '' : formatTopicDurationLabel(effectiveDurSec),
+              duration_minutes: isExplicitlyNoVideo || (isMode2Module && !topicOwnsReady) ? 0 : (effectiveDurSec > 0 ? Math.round(effectiveDurSec / 60) : durMins),
               processing_status: effectiveStatus,
               hls_master_url: effectiveHls,
               source_video_id: effectiveSource,
@@ -1928,8 +2008,8 @@ class CurriculumService {
               }
             }
           }
-        } else if (!isExplicitlyNoVideo && matchedTopics.length > 0) {
-          const sortedDbTopics = [...matchedTopics].sort(sortTopicFn);
+        } else if (!isExplicitlyNoVideo && scopedMatchedTopics.length > 0) {
+          const sortedDbTopics = [...scopedMatchedTopics].sort(sortTopicFn);
           mergedTopics = sortedDbTopics.map((mt, mtIdx) => {
             const durSec = resolveTopicDurationSeconds(mt);
             const durMins = durSec > 0 ? Math.round(durSec / 60) : 0;
@@ -1974,11 +2054,12 @@ class CurriculumService {
           duration: m.duration || durationHrsStr,
           duration_minutes: durationMins,
           duration_hours: m.duration_hours || Math.round((durationMins / 60) * 10) / 10,
-          video_url: isExplicitlyNoVideo ? '' : effectiveHlsUrl,
+          video_url: isExplicitlyNoVideo || isMode2Module ? '' : effectiveHlsUrl,
           video_status: isExplicitlyNoVideo ? 'NO_VIDEO' : videoStatus,
+          video_content_mode: effectiveVideoContentMode,
           hasVideo: !isExplicitlyNoVideo && hasVideoAvailable,
           video_title: m.video_title || m.title || m.name,
-          video_asset_id: isExplicitlyNoVideo ? null : effectiveAssetId,
+          video_asset_id: isExplicitlyNoVideo || isMode2Module ? null : effectiveAssetId,
           video_error_message: isExplicitlyNoVideo ? '' : (m.video_error_message || ''),
           topics: mergedTopics,
           videos: videoCount,

@@ -4903,22 +4903,25 @@ class VideoService {
             .order('updated_at', { ascending: false })
             .limit(1);
           if (lvList && lvList.length > 0 && lvList[0].hls_master_url) {
-            topic = {
-              ...topic,
-              hls_master_url: lvList[0].hls_master_url,
-              hls_prefix: lvList[0].hls_prefix,
-              processing_status: 'READY'
-            };
-            // Persist heal so next curriculum/player load does not hit this fallback again
-            try {
-              const topicReadySync = require('./video.topic-ready-sync.service');
+            const topicReadySync = require('./video.topic-ready-sync.service');
+            const owned = (lvList || []).find((v) =>
+              topicReadySync.lessonVideoBelongsToTopic(v, rawTopId)
+            );
+            if (owned?.hls_master_url) {
+              topic = {
+                ...topic,
+                hls_master_url: owned.hls_master_url,
+                hls_prefix: owned.hls_prefix,
+                processing_status: 'READY'
+              };
+              // Persist heal so next curriculum/player load does not hit this fallback again
               topicReadySync.syncTopicReadyFromLessonVideos(rawTopId, {
                 courseId: effectiveCourseId,
                 moduleId,
-                preferredVideoId: lvList[0].id,
+                preferredVideoId: owned.id,
                 force: true
               }).catch(() => {});
-            } catch (_) {}
+            }
           }
         } catch (e) {}
       }
@@ -4935,13 +4938,31 @@ class VideoService {
     if (!topic || topic.processing_status !== 'READY' || !topic.hls_master_url) {
       // Mode 2: individual topic videos — NEVER fall back to another topic or module video
       const modeHint = String(parentModule?.video_content_mode || '').toUpperCase();
-      const isMode2 =
+      let isMode2 =
         modeHint === 'INDIVIDUAL_TOPIC_VIDEOS' ||
         modeHint === 'TOPIC_VIDEOS' ||
         modeHint === 'MODE_2' ||
         parentModule?.video_status === 'NO_VIDEO' ||
         parentModule?.video_status === 'UNASSIGNED' ||
         (!parentModule?.video_url && Boolean(topic?.video_asset_id || topic?.hls_prefix));
+
+      // Infer Mode 2 when this module has any topic-owned READY lesson_videos
+      if (!isMode2 && moduleId) {
+        try {
+          const { data: siblingTopicVideos } = await supabase
+            .from('lesson_videos')
+            .select('id, topic_id, lesson_id')
+            .eq('module_id', moduleId)
+            .eq('status', 'READY')
+            .not('hls_master_url', 'is', null)
+            .limit(20);
+          isMode2 = (siblingTopicVideos || []).some((v) => {
+            if (v.topic_id) return true;
+            // lesson_id is a topic UUID (not the module id) => topic-owned Mode 2 asset
+            return Boolean(v.lesson_id && String(v.lesson_id) !== String(moduleId));
+          });
+        } catch (_) {}
+      }
 
       if (!isMode2 && parentModule?.video_url && parentModule.video_url.includes('.m3u8')) {
         console.log(`ℹ️ [Topic Stream Auth] Mode 1 fallback to parent module HLS for module ${moduleId}`);
