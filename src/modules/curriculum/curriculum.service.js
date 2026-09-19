@@ -51,6 +51,21 @@ function setCachedPublicCurriculum(key, payload) {
   publicCurriculumCache.set(String(key), { at: Date.now(), payload });
 }
 
+function invalidatePublicCurriculumCache(courseOrKey) {
+  if (!courseOrKey) {
+    publicCurriculumCache.clear();
+    return;
+  }
+  if (typeof courseOrKey === 'string') {
+    publicCurriculumCache.delete(String(courseOrKey).trim().toLowerCase());
+    return;
+  }
+  const id = courseOrKey.id ? String(courseOrKey.id).trim().toLowerCase() : '';
+  const slug = courseOrKey.slug ? String(courseOrKey.slug).trim().toLowerCase() : '';
+  if (id) publicCurriculumCache.delete(id);
+  if (slug) publicCurriculumCache.delete(slug);
+}
+
 /** Persist UUID repairs for modules stored without stable ids. */
 async function healCourseModuleIds(course) {
   if (!course?.id || !Array.isArray(course.curriculum_modules)) return false;
@@ -1467,8 +1482,8 @@ class CurriculumService {
     let dbTopics = [];
     try {
       const [vRes, tRes] = await Promise.all([
-        supabase.from('lesson_videos').select('id, lesson_id, module_id, topic_id, status, hls_master_url, duration_seconds').eq('course_id', course.id),
-        supabase.from('topics').select('id, module_id, title, duration_seconds, display_order, start_time_seconds, end_time_seconds, start_timecode, end_timecode, processing_status, hls_master_url, source_video_id, video_asset_id').eq('course_id', course.id).order('display_order', { ascending: true })
+        supabase.from('lesson_videos').select('id, lesson_id, module_id, topic_id, status, hls_master_url, hls_prefix, duration_seconds, updated_at').eq('course_id', course.id),
+        supabase.from('topics').select('id, module_id, title, duration_seconds, display_order, start_time_seconds, end_time_seconds, start_timecode, end_timecode, processing_status, hls_master_url, hls_prefix, source_video_id, video_asset_id').eq('course_id', course.id).order('display_order', { ascending: true })
       ]);
       dbLessonVideos = vRes.data || [];
       dbTopics = tRes.data || [];
@@ -1484,6 +1499,24 @@ class CurriculumService {
       } catch (retryErr) {
         console.warn('⚠️ [Curriculum Read] Notice fetching DB video telemetry:', retryErr.message || dbErr.message);
       }
+    }
+
+    // Hot-path: if lesson_videos is READY but topics row is still DRAFT, enrich immediately for students
+    // and persist in the background so every course stays playable after upload/transcode.
+    try {
+      const topicReadySync = require('../video/video.topic-ready-sync.service');
+      dbTopics = topicReadySync.enrichTopicsWithReadyLessonVideos(dbTopics, dbLessonVideos);
+      // Fire-and-forget DB heal for any DRAFT topic that already has READY HLS
+      topicReadySync.syncCourseTopicsReadyFromLessonVideos(course.id).then((result) => {
+        if (result?.syncedCount > 0) {
+          invalidatePublicCurriculumCache(course);
+          console.log(`✅ [Curriculum Read] Synced ${result.syncedCount} topic(s) to READY for course ${course.slug || course.id}`);
+        }
+      }).catch((syncErr) => {
+        console.warn('⚠️ [Curriculum Read] Topic ready sync notice:', syncErr.message || syncErr);
+      });
+    } catch (syncLoadErr) {
+      // Non-fatal — enrichment helpers must never break curriculum reads
     }
 
     const sortModuleFn = (a, b) => {
@@ -1544,7 +1577,12 @@ class CurriculumService {
 
     const firstUsableDuration = (candidates) => {
       if (!candidates || candidates.length === 0) return 0;
-      for (const v of candidates) {
+      // Prefer READY rows so a stale UPLOADING duration cannot mask the real HLS asset
+      const ordered = [...candidates].sort((a, b) => {
+        const rank = (v) => (String(v?.status || '').toUpperCase() === 'READY' && v?.hls_master_url ? 0 : 1);
+        return rank(a) - rank(b);
+      });
+      for (const v of ordered) {
         if (isUsableDuration(v?.duration_seconds)) return Number(v.duration_seconds);
       }
       return 0;
@@ -1792,6 +1830,47 @@ class CurriculumService {
               mt?.is_free_preview
             );
 
+            // Heal Mode 2 drift: topics row can stay DRAFT while lesson_videos is READY+HLS
+            const topicKeyCandidates = [
+              !isSyntheticTopicId(mt?.id) ? mt?.id : null,
+              !isSyntheticTopicId(tId) ? tId : null,
+              mt?.source_video_id,
+              mt?.video_asset_id,
+              isObj ? t.source_video_id : null,
+              isObj ? t.video_asset_id : null
+            ].filter(Boolean).map(String);
+
+            let readyLv = null;
+            for (const key of topicKeyCandidates) {
+              const byTopic = (videosByTopicId.get(key) || []).find(
+                (v) => v.status === 'READY' && v.hls_master_url
+              );
+              if (byTopic) { readyLv = byTopic; break; }
+              const byLesson = (videosByLessonId.get(key) || []).find(
+                (v) => v.status === 'READY' && v.hls_master_url
+              );
+              if (byLesson) { readyLv = byLesson; break; }
+              const byId = videosById.get(key);
+              if (byId?.status === 'READY' && byId?.hls_master_url) { readyLv = byId; break; }
+            }
+
+            const rawStatus = isExplicitlyNoVideo
+              ? 'DRAFT'
+              : (mt?.processing_status || (isObj ? t.processing_status : null) || null);
+            const rawHls = isExplicitlyNoVideo
+              ? null
+              : (mt?.hls_master_url || (isObj ? t.hls_master_url : null) || null);
+            const effectiveStatus = (!isExplicitlyNoVideo && readyLv && (!rawHls || String(rawStatus || '').toUpperCase() !== 'READY'))
+              ? 'READY'
+              : (rawStatus || (readyLv ? 'READY' : 'DRAFT'));
+            const effectiveHls = rawHls || readyLv?.hls_master_url || null;
+            const effectiveSource = isExplicitlyNoVideo
+              ? null
+              : (mt?.source_video_id || mt?.video_asset_id || readyLv?.id || (isObj ? (t.source_video_id || t.video_asset_id) : null) || null);
+            const effectiveDurSec = isExplicitlyNoVideo
+              ? 0
+              : (durSec > 0 ? durSec : (Number(readyLv?.duration_seconds) || 0));
+
             return {
               // Prefer real DB UUID over synthetic JSON ids like top_1_3
               id: (!isSyntheticTopicId(mt?.id) ? mt.id : null)
@@ -1802,17 +1881,18 @@ class CurriculumService {
               title: effectiveTitle,
               name: effectiveTitle,
               display_order: tOrder,
+              module_id: mt?.module_id || modIdStr,
               start_time_seconds: isExplicitlyNoVideo ? 0 : (mt?.start_time_seconds ?? (isObj ? (t.start_time_seconds || 0) : 0)),
               end_time_seconds: isExplicitlyNoVideo ? 0 : (mt?.end_time_seconds ?? (isObj ? (t.end_time_seconds || 0) : 0)),
               start_timecode: isExplicitlyNoVideo ? '' : (mt?.start_timecode || (isObj ? (t.start_timecode || '') : '')),
               end_timecode: isExplicitlyNoVideo ? '' : (mt?.end_timecode || (isObj ? (t.end_timecode || '') : '')),
-              duration_seconds: isExplicitlyNoVideo ? 0 : durSec,
-              duration: isExplicitlyNoVideo ? '0s' : formattedDur,
-              duration_minutes: isExplicitlyNoVideo ? 0 : durMins,
-              processing_status: isExplicitlyNoVideo ? 'DRAFT' : (mt?.processing_status || (isObj ? t.processing_status : null) || 'DRAFT'),
-              hls_master_url: isExplicitlyNoVideo ? null : (mt?.hls_master_url || (isObj ? t.hls_master_url : null) || null),
-              source_video_id: isExplicitlyNoVideo ? null : (mt?.source_video_id || (isObj ? t.source_video_id : null) || null),
-              video_asset_id: isExplicitlyNoVideo ? null : (mt?.video_asset_id || mt?.source_video_id || (isObj ? (t.video_asset_id || t.source_video_id) : null) || null),
+              duration_seconds: effectiveDurSec,
+              duration: isExplicitlyNoVideo ? '0s' : formatTopicDurationLabel(effectiveDurSec),
+              duration_minutes: isExplicitlyNoVideo ? 0 : (effectiveDurSec > 0 ? Math.round(effectiveDurSec / 60) : durMins),
+              processing_status: effectiveStatus,
+              hls_master_url: effectiveHls,
+              source_video_id: effectiveSource,
+              video_asset_id: effectiveSource,
               is_preview: isTopicPreview,
               is_free_preview: isTopicPreview
             };
@@ -1990,3 +2070,4 @@ class CurriculumService {
 }
 
 module.exports = new CurriculumService();
+module.exports.invalidatePublicCurriculumCache = invalidatePublicCurriculumCache;

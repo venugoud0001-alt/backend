@@ -3789,13 +3789,24 @@ class VideoService {
     let earlyTopic = memoryVideoStore.get(`topic_${topicId}`);
     if (!earlyTopic) {
       try {
-        const { data } = await supabase.from('topics').select('processing_status, mediaconvert_job_id, processing_identity').eq('id', topicId).maybeSingle();
+        const { data } = await supabase.from('topics').select('processing_status, mediaconvert_job_id, processing_identity, hls_master_url').eq('id', topicId).maybeSingle();
         earlyTopic = data;
       } catch (e) {}
     }
-    if (earlyTopic?.processing_status === 'READY') {
-      console.log(`ℹ️ [Topic Pipeline] Topic ${topicId} already READY. Duplicate completion ignored.`);
+    // Only short-circuit when topic is already playable (READY + HLS). A READY row without HLS
+    // (or DRAFT after a re-upload race) must still run the full sync path.
+    if (earlyTopic?.processing_status === 'READY' && earlyTopic?.hls_master_url) {
+      console.log(`ℹ️ [Topic Pipeline] Topic ${topicId} already READY with HLS. Ensuring lesson_videos + curriculum sync.`);
       await mediaConvertJobGuard.markClaimReady({ mediaconvertJobId: jobId, processingIdentity: earlyTopic.processing_identity });
+      try {
+        const topicReadySync = require('./video.topic-ready-sync.service');
+        await topicReadySync.syncTopicReadyFromLessonVideos(topicId, {
+          courseId,
+          moduleId,
+          preferredVideoId: sourceVideoId,
+          force: false
+        });
+      } catch (_) {}
       return;
     }
     if (jobId && earlyTopic?.mediaconvert_job_id && String(jobId) !== String(earlyTopic.mediaconvert_job_id)) {
@@ -3899,7 +3910,7 @@ class VideoService {
     });
 
     try {
-      const { error: topErr } = await supabase.from('topics').update({
+      const topicPatch = {
         processing_status: 'READY',
         hls_prefix: effectivePrefix,
         hls_master_url: masterUrl,
@@ -3909,7 +3920,13 @@ class VideoService {
         processing_error: null,
         processing_completed_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
-      }).eq('id', topicId);
+      };
+      const readyDuration = Number(activeLessonVideo?.duration_seconds) > 1
+        ? Number(activeLessonVideo.duration_seconds)
+        : (Number(dbTopic?.duration_seconds) > 1 ? Number(dbTopic.duration_seconds) : null);
+      if (readyDuration) topicPatch.duration_seconds = readyDuration;
+
+      const { error: topErr } = await supabase.from('topics').update(topicPatch).eq('id', topicId);
       if (topErr) {
         console.error(`❌ [Topic DB Update Error] Failed to update topic ${topicId}:`, topErr);
       }
@@ -3917,7 +3934,7 @@ class VideoService {
       console.error(`❌ [Topic DB Update Exception] Failed to update topic ${topicId}:`, e);
     }
 
-    // Also update the lesson_videos record for this topic's video asset
+    // Mark lesson_videos READY first so topic-ready-sync can prefer this asset
     try {
       if (sourceVideoId) {
         await this.upsertVideoRecord({
@@ -3935,6 +3952,19 @@ class VideoService {
         });
       }
     } catch (e) {}
+
+    // Canonical ready-sync: topics row + curriculum JSON + cache bust (Mode 2 safety net)
+    try {
+      const topicReadySync = require('./video.topic-ready-sync.service');
+      await topicReadySync.syncTopicReadyFromLessonVideos(topicId, {
+        courseId,
+        moduleId,
+        preferredVideoId: sourceVideoId,
+        force: true
+      });
+    } catch (syncErr) {
+      console.warn(`⚠️ [Topic Pipeline] Ready sync notice for ${topicId}:`, syncErr.message || syncErr);
+    }
 
     // Update Course Curriculum Modules JSON with topic READY status and video_url
     if (courseId) {
@@ -4879,6 +4909,16 @@ class VideoService {
               hls_prefix: lvList[0].hls_prefix,
               processing_status: 'READY'
             };
+            // Persist heal so next curriculum/player load does not hit this fallback again
+            try {
+              const topicReadySync = require('./video.topic-ready-sync.service');
+              topicReadySync.syncTopicReadyFromLessonVideos(rawTopId, {
+                courseId: effectiveCourseId,
+                moduleId,
+                preferredVideoId: lvList[0].id,
+                force: true
+              }).catch(() => {});
+            } catch (_) {}
           }
         } catch (e) {}
       }
