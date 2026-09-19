@@ -1536,6 +1536,8 @@ class CurriculumService {
     // Resolve real topic length from topics + lesson_videos. Never invent a fake default (was 855s = 14m15s).
     // Prefer lesson_videos when present — topics/JSON may still carry the old 855 sentinel.
     const FAKE_TOPIC_DURATION_SECONDS = 855;
+    // Placeholder Mode-1 style ranges like 00:07–00:08 (1s) must never override a real lecture length
+    const MIN_REAL_DURATION_SECONDS = 5;
     const isSyntheticTopicId = (id) => {
       const s = String(id || '').trim();
       if (!s) return true;
@@ -1545,7 +1547,7 @@ class CurriculumService {
     };
     const isUsableDuration = (sec) => {
       const n = Number(sec) || 0;
-      return n > 0 && n !== FAKE_TOPIC_DURATION_SECONDS;
+      return n >= MIN_REAL_DURATION_SECONDS && n !== FAKE_TOPIC_DURATION_SECONDS;
     };
 
     // O(1) indexes — avoid O(topics × videos) scans during formatJsonCurriculum
@@ -1614,14 +1616,9 @@ class CurriculumService {
     };
 
     const resolveTopicDurationSeconds = (mt, jsonTopic = null) => {
+      // Only original uploaded-video length. Never invent from placeholder clip ranges (1s, 00:07–00:08).
       const fromVideo = findLessonVideoDuration(mt, jsonTopic);
       if (fromVideo > 0) return fromVideo;
-
-      const startSec = Number(mt?.start_time_seconds ?? jsonTopic?.start_time_seconds) || 0;
-      const endSec = Number(mt?.end_time_seconds ?? jsonTopic?.end_time_seconds) || 0;
-      const clipDur = endSec > startSec ? (endSec - startSec) : 0;
-      // Mode 1 clips: real boundaries. Ignore clip if it equals the old fake default.
-      if (isUsableDuration(clipDur) && (startSec > 0 || endSec > 0)) return clipDur;
 
       if (isUsableDuration(mt?.duration_seconds)) return Number(mt.duration_seconds);
       if (isUsableDuration(jsonTopic?.duration_seconds)) return Number(jsonTopic.duration_seconds);
@@ -1941,7 +1938,9 @@ class CurriculumService {
               : (readyLv?.id || mt?.source_video_id || mt?.video_asset_id || (!isMode2Module && isObj ? (t.source_video_id || t.video_asset_id) : null) || null);
             const effectiveDurSec = isExplicitlyNoVideo || (isMode2Module && !topicOwnsReady)
               ? 0
-              : (durSec > 0 ? durSec : (Number(readyLv?.duration_seconds) || 0));
+              : (isUsableDuration(readyLv?.duration_seconds)
+                ? Number(readyLv.duration_seconds)
+                : (isUsableDuration(durSec) ? durSec : 0));
 
             return {
               // Prefer real DB UUID over synthetic JSON ids like top_1_3
