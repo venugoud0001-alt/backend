@@ -40,6 +40,8 @@ module.exports = {
   SMTP_PASS: process.env.SMTP_PASS ? process.env.SMTP_PASS.replace(/\s+/g, '') : '',
   SMTP_FROM: process.env.SMTP_FROM || `"InternNetra Team" <${process.env.SMTP_USER || 'info@internnetra.com'}>`,
   CORS_ALLOWED_ORIGINS: process.env.CORS_ALLOWED_ORIGINS,
+  FRONTEND_URL: process.env.FRONTEND_URL || 'https://internnetra.com',
+  BACKEND_URL: process.env.BACKEND_URL || 'https://api.internnetra.com',
   
   // AWS Video Infrastructure Configuration (Phase 2 & 3)
   AWS_REGION: process.env.AWS_REGION || 'ap-south-1',

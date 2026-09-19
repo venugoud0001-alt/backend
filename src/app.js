@@ -44,57 +44,115 @@ const defaultProductionOrigins = [
 ];
 
 const envOrigins = env.CORS_ALLOWED_ORIGINS
-  ? env.CORS_ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
+  ? env.CORS_ALLOWED_ORIGINS.split(',').map(o => o.trim().replace(/\/+$/, '')).filter(Boolean)
   : [];
+
+const frontendOrigin = String(env.FRONTEND_URL || process.env.FRONTEND_URL || '')
+  .trim()
+  .replace(/\/+$/, '');
 
 const productionAllowlist = new Set([
   ...defaultProductionOrigins,
-  ...envOrigins
+  ...envOrigins,
+  ...(frontendOrigin ? [frontendOrigin] : [])
 ]);
 
-app.use(cors({
+const normalizeOrigin = (origin) => String(origin || '').trim().replace(/\/+$/, '');
+
+const isAllowedOrigin = (origin) => {
+  const normalized = normalizeOrigin(origin);
+  if (!normalized) return false;
+  if (productionAllowlist.has(normalized)) return true;
+  // Case-insensitive host match for allowlisted production domains
+  try {
+    const { protocol, host } = new URL(normalized);
+    if (protocol !== 'https:' && protocol !== 'http:') return false;
+    const candidate = `${protocol}//${host.toLowerCase()}`;
+    return productionAllowlist.has(candidate);
+  } catch {
+    return false;
+  }
+};
+
+const corsAllowedHeaders = [
+  'Content-Type',
+  'Authorization',
+  'X-Requested-With',
+  'Accept',
+  'Range',
+  'Origin',
+  'Cache-Control',
+  'Pragma',
+  'Expires',
+  'x-webhook-secret'
+];
+
+const corsOptions = {
   origin: (origin, callback) => {
     const isProduction = process.env.NODE_ENV === 'production';
 
-    // 1. In Production: Strict exact match against approved production domains only
-    if (isProduction) {
-      if (origin && productionAllowlist.has(origin)) {
+    // Same-origin / server-to-server tools often omit Origin
+    if (!origin) {
+      return callback(null, !isProduction);
+    }
+
+    if (isAllowedOrigin(origin)) {
+      return callback(null, true);
+    }
+
+    if (!isProduction) {
+      if (
+        origin.startsWith('http://localhost:') ||
+        origin.startsWith('http://127.0.0.1:') ||
+        origin.startsWith('http://[::1]:') ||
+        origin === 'http://localhost' ||
+        origin === 'http://127.0.0.1'
+      ) {
         return callback(null, true);
       }
-      // Strictly reject: null, lookalikes, localhost, 127.0.0.1, 192.168.*, 10.*, 172.*
-      return callback(null, false);
     }
 
-    // 2. In Development / Test:
-    if (!origin) {
-      return callback(null, true);
-    }
-
-    if (
-      productionAllowlist.has(origin) ||
-      origin.startsWith('http://localhost:') ||
-      origin.startsWith('http://127.0.0.1:') ||
-      origin.startsWith('http://[::1]:') ||
-      origin === 'http://localhost' ||
-      origin === 'http://127.0.0.1'
-    ) {
-      return callback(null, true);
-    }
-
+    // Reject without throwing — throwing can omit ACAO and confuse browsers
     return callback(null, false);
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Range', 'Origin', 'x-webhook-secret'],
-  exposedHeaders: ['ETag', 'Content-Range', 'Accept-Ranges']
-}));
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
+  allowedHeaders: corsAllowedHeaders,
+  exposedHeaders: ['ETag', 'Content-Range', 'Accept-Ranges'],
+  optionsSuccessStatus: 204,
+  maxAge: 86400
+};
 
-// Rate Limiting Guards
+// Attach ACAO early so rate-limit / error responses still pass browser CORS checks
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && isAllowedOrigin(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', normalizeOrigin(origin));
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
+  }
+  if (req.method === 'OPTIONS') {
+    if (origin && isAllowedOrigin(origin)) {
+      res.setHeader('Access-Control-Allow-Methods', corsOptions.methods.join(','));
+      res.setHeader('Access-Control-Allow-Headers', corsAllowedHeaders.join(','));
+      res.setHeader('Access-Control-Max-Age', String(corsOptions.maxAge));
+      return res.sendStatus(204);
+    }
+    // Unknown origin preflight — end without ACAO (browser will block)
+    return res.sendStatus(204);
+  }
+  return next();
+});
+
+app.use(cors(corsOptions));
+
+// Rate Limiting Guards (skip OPTIONS — already answered above)
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.method === 'OPTIONS',
   message: { success: false, code: 'RATE_LIMIT_EXCEEDED', message: 'Too many authentication attempts. Please try again later.' }
 });
 
@@ -103,6 +161,7 @@ const streamAuthLimiter = rateLimit({
   max: 120, // 120 stream auth requests per min
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.method === 'OPTIONS',
   message: { success: false, code: 'RATE_LIMIT_EXCEEDED', message: 'Too many stream requests. Please slow down.' }
 });
 
@@ -111,6 +170,16 @@ const generalApiLimiter = rateLimit({
   max: process.env.NODE_ENV === 'production' ? 5000 : 20000,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.method === 'OPTIONS',
+  handler: (req, res, _next, options) => {
+    const origin = req.headers.origin;
+    if (origin && isAllowedOrigin(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', normalizeOrigin(origin));
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Vary', 'Origin');
+    }
+    res.status(options.statusCode).json(options.message);
+  },
   message: { success: false, code: 'RATE_LIMIT_EXCEEDED', message: 'Too many API requests. Please try again in a moment.' }
 });
 
