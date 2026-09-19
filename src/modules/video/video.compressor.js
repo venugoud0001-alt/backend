@@ -20,26 +20,29 @@ class VideoCompressor {
     const size = Number(fileSizeBytes) || 0;
     const duration = Number(durationSeconds) || 0;
     
-    // Determine resolution tier (Resolution-aware: <720p -> 480p, 720p -> 720p, >=1080p -> 1080p)
-    let targetResolution = '1080p';
-    let targetWidth = 1920;
-    let targetHeight = 1080;
+    // Determine resolution tier (never upscale; height-primary):
+    // <720p -> 480p only; >=720p & <1080p -> 720p only; >=1080p -> 720p+1080p (capped)
+    let targetResolution = '720p';
+    let targetWidth = 1280;
+    let targetHeight = 720;
 
-    const sourceHeight = Number(height) || 1080;
-    const sourceWidth = Number(width) || 1920;
+    const sourceHeight = Number(height) || 0;
+    const sourceWidth = Number(width) || 0;
 
-    if (sourceHeight <= 480 || sourceWidth <= 854) {
-      targetResolution = '480p';
-      targetWidth = 854;
-      targetHeight = 480;
-    } else if (sourceHeight <= 720 || sourceWidth <= 1280) {
-      targetResolution = '720p';
-      targetWidth = 1280;
-      targetHeight = 720;
-    } else {
-      targetResolution = '1080p';
-      targetWidth = 1920;
-      targetHeight = 1080;
+    if (sourceHeight > 0 || sourceWidth > 0) {
+      if (sourceHeight >= 1080 || (sourceHeight === 0 && sourceWidth >= 1920)) {
+        targetResolution = '1080p';
+        targetWidth = 1920;
+        targetHeight = 1080;
+      } else if (sourceHeight >= 720 || sourceWidth >= 1280) {
+        targetResolution = '720p';
+        targetWidth = 1280;
+        targetHeight = 720;
+      } else {
+        targetResolution = '480p';
+        targetWidth = 854;
+        targetHeight = 480;
+      }
     }
 
     // Estimate bitrate if missing from metadata
@@ -115,14 +118,20 @@ class VideoCompressor {
     const baseDest = `s3://${outputBucket}/${outputKeyPrefix}`.replace(/\/+$/, '');
     const destination = `${baseDest}/master`;
 
+    // Advanced preprocessors (Deinterlacer) force Professional-tier billing.
+    // Only enable when interlaced is explicitly detected AND allowProfessionalFeatures is set.
     const isInterlaced = Boolean(analysis && (analysis.isInterlaced || analysis.scanType === 'interlaced'));
-    const videoPreprocessors = isInterlaced ? {
+    const allowProfessional = Boolean(analysis && analysis.allowProfessionalFeatures);
+    const videoPreprocessors = (isInterlaced && allowProfessional) ? {
       Deinterlacer: {
         Algorithm: 'INTERPOLATE',
         Mode: 'DEINTERLACE',
         Control: 'NORMAL'
       }
     } : undefined;
+    if (isInterlaced && !allowProfessional) {
+      console.warn('⚠️ [VideoCompressor] Interlaced source detected but Deinterlacer skipped to stay on Basic tier.');
+    }
 
     const outputs = [];
 

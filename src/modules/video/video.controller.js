@@ -254,12 +254,15 @@ class VideoController {
    */
   async transcodeFullVideo(req, res, next) {
     try {
-      const { moduleId, courseId, videoAssetId, lessonId } = req.body || {};
+      const { moduleId, courseId, videoAssetId, lessonId, adminOverride, forceReprocess, confirmReprocess } = req.body || {};
       const result = await videoService.startFullVideoTranscoding(req.user, {
         moduleId,
         courseId,
         videoAssetId,
-        lessonId
+        lessonId,
+        adminOverride: Boolean(adminOverride),
+        forceReprocess: Boolean(forceReprocess),
+        confirmReprocess: Boolean(confirmReprocess)
       });
       return successResponse(res, result, 200, 'Full-video MediaConvert transcoding started successfully.');
     } catch (err) {
@@ -678,12 +681,14 @@ class VideoController {
   async startTopicBatchProcessing(req, res, next) {
     try {
       const { moduleId } = req.params;
-      const { courseId, sourceVideoId, topicIds } = req.body || {};
+      const { courseId, sourceVideoId, topicIds, adminOverride, forceReset } = req.body || {};
       const result = await videoService.startTopicBatchProcessing(req.user, {
         moduleId,
         courseId,
         sourceVideoId,
-        topicIds
+        topicIds,
+        adminOverride: Boolean(adminOverride),
+        forceReset: Boolean(forceReset)
       });
       return successResponse(res, result, 200, 'MediaConvert topic batch processing initiated.');
     } catch (err) {

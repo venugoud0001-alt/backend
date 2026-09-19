@@ -6,6 +6,8 @@
 const { supabase } = require('../../config/supabase');
 const s3VideoService = require('./video.s3.service');
 const mediaConvertVideoService = require('./video.mediaconvert.service');
+const mediaConvertJobGuard = require('./video.job-guard.service');
+const videoSourceProbe = require('./video.source-probe');
 const {
   VIDEO_STATUS,
   VALID_TRANSCODING_ENTRY_STATUSES,
@@ -15,7 +17,9 @@ const {
   DEFAULT_PART_SIZE_BYTES,
   DEFAULT_CONCURRENCY,
   DEFAULT_MAX_RETRIES,
-  MULTIPART_THRESHOLD_BYTES
+  MULTIPART_THRESHOLD_BYTES,
+  PROCESSING_PROFILES,
+  TRIGGER_SOURCES
 } = require('./video.constants');
 const { addCalendarMonths, isAccessExpired } = require('../../utils/dateUtils');
 const cloudFrontVideoService = require('./video.cloudfront.service');
@@ -40,6 +44,93 @@ class VideoService {
   constructor() {
     this.memoryVideoStore = memoryVideoStore;
   }
+
+  /**
+   * Central guarded MediaConvert submission.
+   * Acquires atomic claim → CreateJob once → attaches job id / releases on failure.
+   */
+  async submitGuardedMediaConvertJob({
+    processingProfile,
+    submitFn,
+    videoId = null,
+    uploadId = null,
+    courseId = null,
+    moduleId = null,
+    topicId = null,
+    sourceKey = null,
+    sourceDurationSeconds = null,
+    sourceWidth = null,
+    sourceHeight = null,
+    triggerSource = TRIGGER_SOURCES.OTHER,
+    adminOverride = false,
+    forceReprocess = false,
+    confirmReprocess = false,
+    existingRecord = null,
+    existingTopic = null,
+    isRetry = false
+  }) {
+    const claimResult = await mediaConvertJobGuard.acquireProcessingClaim({
+      processingProfile,
+      videoId,
+      uploadId,
+      courseId,
+      moduleId,
+      topicId,
+      sourceKey,
+      sourceDurationSeconds,
+      sourceWidth,
+      sourceHeight,
+      triggerSource,
+      adminOverride,
+      forceReprocess,
+      confirmReprocess,
+      existingRecord,
+      existingTopic,
+      s3VideoService,
+      isRetry
+    });
+
+    if (!claimResult.shouldCreateJob) {
+      return {
+        duplicated: true,
+        reused: true,
+        reason: claimResult.reason,
+        jobId: claimResult.existingJobId || null,
+        processingIdentity: claimResult.processingIdentity,
+        processingProfile: claimResult.processingProfile,
+        requestedOutputs: claimResult.requestedOutputs,
+        hlsMasterUrl: claimResult.hlsMasterUrl || null
+      };
+    }
+
+    const claim = claimResult.claim;
+    try {
+      const jobResult = await submitFn({
+        requestedOutputs: claim.requestedOutputs,
+        sourceHeight,
+        sourceWidth
+      });
+      await mediaConvertJobGuard.attachJobId(claim, jobResult.jobId);
+      return {
+        duplicated: false,
+        reused: false,
+        jobResult,
+        claim,
+        processingIdentity: claim.processingIdentity,
+        processingProfile: claim.processingProfile,
+        requestedOutputs: claim.requestedOutputs
+      };
+    } catch (err) {
+      await mediaConvertJobGuard.releaseClaim({
+        claimId: claim.id,
+        claimOwnerToken: claim.claimOwnerToken,
+        processingIdentity: claim.processingIdentity,
+        errorMessage: err.message || String(err)
+      });
+      throw err;
+    }
+  }
+
   /**
    * Helper to safely persist video record to Supabase
    */
@@ -893,21 +984,24 @@ class VideoService {
       const { data: records, error } = await supabase
         .from('lesson_videos')
         .select('*')
-        .in('status', ['UPLOADING', 'UPLOADED', 'PROCESSING', 'READY', 'FAILED'])
+        .in('status', ['UPLOADING', 'UPLOADED', 'PROCESSING', 'SEGMENTATION_REQUIRED', 'SEGMENTATION_CONFIRMED'])
         .order('updated_at', { ascending: false })
         .limit(50);
 
       const allRecords = (Array.isArray(records) && records.length > 0)
         ? records
-        : Array.from(memoryVideoStore.values());
+        : Array.from(memoryVideoStore.values()).filter((r) =>
+            ['UPLOADING', 'UPLOADED', 'PROCESSING', 'SEGMENTATION_REQUIRED', 'SEGMENTATION_CONFIRMED'].includes(String(r.status || ''))
+          );
 
       // STRICT PRECEDENCE:
       // 1. In-browser S3 uploads cannot persist across browser refreshes without active client streaming.
       // Filter out any stale 'UPLOADING' records where updated_at is older than 10 minutes.
       const now = Date.now();
+      const STALE_PROCESSING_MS = 45 * 60 * 1000; // no MediaConvert progress for 45m → not "active work"
       const nonStaleRecords = allRecords.filter(r => {
+        const ageMs = now - new Date(r.updated_at || r.upload_started_at || r.created_at || 0).getTime();
         if (r.status === 'UPLOADING') {
-          const ageMs = now - new Date(r.updated_at || r.upload_started_at || r.created_at || 0).getTime();
           if (ageMs > 10 * 60 * 1000) return false;
         }
         return true;
@@ -923,6 +1017,9 @@ class VideoService {
 
       const s3PathUtils = require('../../utils/s3PathUtils');
       const enriched = await Promise.all(deduplicated.map(async (r) => {
+        const ageMs = now - new Date(r.updated_at || r.upload_started_at || r.created_at || 0).getTime();
+        const hasMcJob = Boolean(r.mediaconvert_job_id || r.job_id);
+
         let segmentInfo = { segmentCount: 0, manifestCount: 0, totalFiles: 0 };
         if (r.status === VIDEO_STATUS.PROCESSING) {
           const effectivePrefix = r.hls_prefix || 
@@ -938,9 +1035,19 @@ class VideoService {
           (r.lesson_id && r.module_id && String(r.lesson_id) !== String(r.module_id))
         );
 
-        // Only query module topics for active/processing records or explicit topic mode on MODULE-level jobs
+        const processingProfile = String(r.processing_profile || '');
+        // Mode 1 master HLS encode (not Mode 2 topic upload, not idle clipping wait)
+        const isLiveFullModuleEncode = Boolean(
+          !isIndividualTopic &&
+          r.status === VIDEO_STATUS.PROCESSING &&
+          hasMcJob &&
+          ageMs < STALE_PROCESSING_MS &&
+          (processingProfile === PROCESSING_PROFILES.FULL_MODULE_HLS || !processingProfile || processingProfile === 'FULL_MODULE_HLS')
+        );
+
+        // Topic summaries: useful for clipping progress, but must not override a live Mode 1 master job
         let topicsSummary = null;
-        if (!isIndividualTopic && (r.is_topic_mode || r.status === VIDEO_STATUS.PROCESSING || r.status === VIDEO_STATUS.UPLOADED)) {
+        if (!isIndividualTopic && (r.is_topic_mode || r.status === VIDEO_STATUS.PROCESSING || r.status === VIDEO_STATUS.UPLOADED || r.status === VIDEO_STATUS.SEGMENTATION_REQUIRED)) {
           try {
             const topicRes = await this.getModuleTopics(null, { moduleId: r.module_id || r.lesson_id, courseId: r.course_id, skipJobPolling: true });
             if (topicRes && Array.isArray(topicRes.topics) && topicRes.topics.length > 0) {
@@ -956,9 +1063,70 @@ class VideoService {
           } catch (e) {}
         }
 
-        const isTopicProcessing = topicsSummary && (topicsSummary.processingTopics > 0 || topicsSummary.queuedTopics > 0);
-        const isTopicReady = topicsSummary && topicsSummary.totalTopics > 0 && topicsSummary.readyTopics === topicsSummary.totalTopics;
-        const effectiveStatus = isTopicReady ? VIDEO_STATUS.READY : (isTopicProcessing ? VIDEO_STATUS.PROCESSING : r.status);
+        const hasLiveTopicJobs = Boolean(
+          topicsSummary && ((topicsSummary.processingTopics || 0) > 0 || (topicsSummary.queuedTopics || 0) > 0)
+        );
+        const allTopicsReady = Boolean(
+          topicsSummary && topicsSummary.totalTopics > 0 && topicsSummary.readyTopics === topicsSummary.totalTopics
+        );
+        // Ghost drawer case: some clips READY, nothing encoding, master job not live
+        const partialTopicsIdle = Boolean(
+          topicsSummary &&
+          topicsSummary.totalTopics > 0 &&
+          !hasLiveTopicJobs &&
+          !allTopicsReady &&
+          (topicsSummary.readyTopics || 0) > 0 &&
+          !isLiveFullModuleEncode
+        );
+
+        let effectiveStatus = r.status;
+        if (isIndividualTopic) {
+          // Mode 2: trust lesson_videos row status (PROCESSING / UPLOADING / etc.)
+          effectiveStatus = r.status;
+        } else if (isLiveFullModuleEncode) {
+          // Mode 1 master still encoding — keep PROCESSING even if topic outline exists (all DRAFT)
+          effectiveStatus = VIDEO_STATUS.PROCESSING;
+        } else if (hasLiveTopicJobs) {
+          effectiveStatus = VIDEO_STATUS.PROCESSING;
+        } else if (allTopicsReady) {
+          effectiveStatus = VIDEO_STATUS.READY;
+        } else if (partialTopicsIdle) {
+          effectiveStatus = VIDEO_STATUS.SEGMENTATION_REQUIRED;
+        }
+
+        const staleStuckProcessing = r.status === VIDEO_STATUS.PROCESSING
+          && !isLiveFullModuleEncode
+          && !hasLiveTopicJobs
+          && !hasMcJob
+          && ageMs > STALE_PROCESSING_MS;
+
+        if (staleStuckProcessing) {
+          effectiveStatus = VIDEO_STATUS.SEGMENTATION_REQUIRED;
+        }
+
+        // Only surface jobs with real in-flight work to the Background Videos drawer
+        const isLiveWork =
+          effectiveStatus === 'UPLOADING' ||
+          effectiveStatus === VIDEO_STATUS.PROCESSING ||
+          (effectiveStatus === VIDEO_STATUS.UPLOADED && ageMs < 30 * 60 * 1000) ||
+          effectiveStatus === 'SEGMENTATION_CONFIRMED';
+
+        if (!isLiveWork) {
+          // Heal sticky ghosts only — never touch a live Mode 1 master encode
+          if (
+            r.status === VIDEO_STATUS.PROCESSING &&
+            !isLiveFullModuleEncode &&
+            (partialTopicsIdle || staleStuckProcessing || allTopicsReady)
+          ) {
+            const healStatus = allTopicsReady ? VIDEO_STATUS.READY : VIDEO_STATUS.SEGMENTATION_REQUIRED;
+            this.upsertVideoRecord({
+              ...r,
+              status: healStatus,
+              updated_at: new Date().toISOString()
+            }).catch(() => {});
+          }
+          return null;
+        }
 
         return {
           id: r.id,
@@ -991,9 +1159,10 @@ class VideoService {
         };
       }));
 
-      this._activeJobsCache = enriched;
+      const liveOnly = enriched.filter(Boolean);
+      this._activeJobsCache = liveOnly;
       this._activeJobsCacheTime = Date.now();
-      return enriched;
+      return liveOnly;
     } catch (err) {
       console.warn('⚠️ [Video Service] listActiveTranscodingJobs notice:', err.message);
       if (this._activeJobsCache) return this._activeJobsCache;
@@ -1308,7 +1477,7 @@ class VideoService {
    * 2B. Start Full Video Transcoding (MediaConvert Adaptive Transcode)
    * Dispatches full single-video MediaConvert job for a module directly
    */
-  async startFullVideoTranscoding(adminUser, { moduleId, courseId, videoAssetId, lessonId } = {}) {
+  async startFullVideoTranscoding(adminUser, { moduleId, courseId, videoAssetId, lessonId, adminOverride = false, forceReprocess = false, confirmReprocess = false } = {}) {
     const s3PathUtils = require('../../utils/s3PathUtils');
     const videoCompressor = require('./video.compressor');
     const { COMPRESSION_SETTINGS, VIDEO_STATUS, VALID_TRANSCODING_ENTRY_STATUSES } = require('./video.constants');
@@ -1329,7 +1498,8 @@ class VideoService {
       VIDEO_STATUS.SEGMENTATION_READY,
       VIDEO_STATUS.SEGMENTATION_CONFIRMED,
       VIDEO_STATUS.FAILED,
-      VIDEO_STATUS.PROCESSING
+      VIDEO_STATUS.PROCESSING,
+      VIDEO_STATUS.READY
     ];
     if (!allowedStartStatuses.includes(currentStatus)) {
       if (currentStatus === VIDEO_STATUS.UPLOADING) {
@@ -1356,29 +1526,22 @@ class VideoService {
       throw { statusCode: 400, message: `Source video file not found in S3 (s3://${effectiveBucket}/${effectiveKey}).` };
     }
 
-    // Duplicate Job Protection: Check if already actively transcoding
-    if (videoCompressor.isJobAlreadyActive(record, COMPRESSION_SETTINGS.JOB_TIMEOUT_MINUTES)) {
-      console.log(`ℹ️ [Video Pipeline] Module/Lesson ${record.module_id || record.lesson_id} already has an active MediaConvert job (${record.mediaconvert_job_id}). Duplicate submission avoided.`);
-      return {
-        status: 'SUCCESS',
-        videoAssetId: record.id,
-        jobId: record.mediaconvert_job_id,
-        processingStatus: VIDEO_STATUS.PROCESSING,
-        message: 'Active transcoding job already in progress.'
-      };
-    }
-
     const sourceSizeBytes = existsResult.contentLength || record.file_size_bytes || 0;
+    const metrics = await videoSourceProbe.resolveSourceMetrics(record);
 
     // Resolve course for slug generation if needed
     const course = await this.resolveCourse(courseId || record.course_id);
     const courseSlug = record.course_slug || (course ? s3PathUtils.generateS3CourseSlug(course) : 'course');
     const moduleSlug = record.module_slug || s3PathUtils.generateS3ModuleSlug(record.module_id || moduleId);
 
-    // Run Multi-Signal Adaptive Analysis
+    // Run Multi-Signal Adaptive Analysis WITH real dimensions (never default to 1080p)
     const analysis = videoCompressor.analyzeVideoSource({
       fileSizeBytes: sourceSizeBytes,
-      durationSeconds: record.duration_seconds || record.source_duration_seconds || 0,
+      durationSeconds: metrics.durationSeconds || record.duration_seconds || record.source_duration_seconds || 0,
+      width: metrics.width,
+      height: metrics.height,
+      fps: metrics.fps,
+      videoCodec: metrics.videoCodec,
       fileName: record.title || effectiveKey
     });
 
@@ -1390,20 +1553,59 @@ class VideoService {
     const cdnDomain = env.CLOUDFRONT_DOMAIN || `https://${env.AWS_S3_BUCKET_OUTPUT || effectiveBucket}.s3.${env.AWS_REGION}.amazonaws.com`;
     const masterPlaylistUrl = `${cdnDomain}/${outputPrefix}master.m3u8`;
 
-    // Start AWS MediaConvert Job
-    const jobResult = await mediaConvertVideoService.submitAdaptiveJob({
-      sourceBucket: effectiveBucket,
+    const guarded = await this.submitGuardedMediaConvertJob({
+      processingProfile: PROCESSING_PROFILES.FULL_MODULE_HLS,
+      videoId: record.id,
+      uploadId: record.upload_id || record.source_s3_key,
+      courseId: record.course_id || courseId,
+      moduleId: record.module_id || moduleId,
       sourceKey: effectiveKey,
-      outputPrefix,
-      analysis,
-      userMetadata: {
-        videoAssetId: String(record.id),
-        lessonId: String(record.lesson_id || identifier),
-        moduleId: String(record.module_id || moduleId),
-        courseId: String(record.course_id || courseId),
-        sourceSizeBytes: String(sourceSizeBytes)
+      sourceDurationSeconds: metrics.durationSeconds || record.duration_seconds || record.source_duration_seconds || 0,
+      sourceWidth: metrics.width,
+      sourceHeight: metrics.height,
+      triggerSource: forceReprocess ? TRIGGER_SOURCES.MANUAL_REPROCESS : TRIGGER_SOURCES.ADMIN_UPLOAD,
+      adminOverride,
+      forceReprocess: Boolean(forceReprocess),
+      confirmReprocess: Boolean(confirmReprocess),
+      existingRecord: record,
+      isRetry: currentStatus === VIDEO_STATUS.FAILED,
+      submitFn: async ({ requestedOutputs, sourceHeight, sourceWidth }) => {
+        return mediaConvertVideoService.submitAdaptiveJob({
+          sourceBucket: effectiveBucket,
+          sourceKey: effectiveKey,
+          outputPrefix,
+          analysis,
+          requestedOutputs,
+          sourceHeight,
+          sourceWidth,
+          userMetadata: {
+            videoAssetId: String(record.id),
+            lessonId: String(record.lesson_id || identifier),
+            moduleId: String(record.module_id || moduleId),
+            courseId: String(record.course_id || courseId),
+            sourceSizeBytes: String(sourceSizeBytes),
+            processingProfile: PROCESSING_PROFILES.FULL_MODULE_HLS
+          }
+        });
       }
     });
+
+    if (guarded.duplicated) {
+      console.log(`ℹ️ [DUPLICATE_MEDIACONVERT_JOB_BLOCKED] Full-video identity reuse for ${record.id}: ${guarded.reason} job=${guarded.jobId}`);
+      return {
+        status: 'SUCCESS',
+        videoAssetId: record.id,
+        jobId: guarded.jobId,
+        processingStatus: record.status === VIDEO_STATUS.READY ? VIDEO_STATUS.READY : VIDEO_STATUS.PROCESSING,
+        duplicated: true,
+        reason: guarded.reason,
+        message: guarded.reason === 'READY_OUTPUT_REUSED'
+          ? 'Existing READY HLS output reused. No MediaConvert job created.'
+          : 'Active transcoding job already in progress.'
+      };
+    }
+
+    const jobResult = guarded.jobResult;
 
     // Update Status to PROCESSING in Supabase
     const updatedRecord = await this.upsertVideoRecord({
@@ -1414,6 +1616,11 @@ class VideoService {
       file_size_bytes: sourceSizeBytes,
       original_resolution: analysis.targetResolution,
       output_resolution: analysis.targetResolution,
+      source_width: metrics.width,
+      source_height: metrics.height,
+      source_fps: metrics.fps,
+      processing_identity: guarded.processingIdentity,
+      processing_profile: guarded.processingProfile,
       error_code: null,
       error_message: null,
       hls_master_url: masterPlaylistUrl,
@@ -1423,7 +1630,7 @@ class VideoService {
       updated_at: new Date().toISOString()
     });
 
-    console.log(`🎬 [Video Pipeline] MediaConvert Job ${jobResult.jobId} submitted for module ${record.module_id || record.lesson_id} (Status: PROCESSING).`);
+    console.log(`🎬 [Video Pipeline] MediaConvert Job ${jobResult.jobId} submitted for module ${record.module_id || record.lesson_id} (Status: PROCESSING, outputs=${(guarded.requestedOutputs || []).join(',')}, tier=${jobResult.pricingTierExpected || 'BASIC'}).`);
 
     return {
       status: 'SUCCESS',
@@ -1433,6 +1640,7 @@ class VideoService {
       processingStatus: VIDEO_STATUS.PROCESSING,
       masterPlaylistUrl: masterPlaylistUrl,
       targetResolution: analysis.targetResolution,
+      requestedOutputs: guarded.requestedOutputs,
       message: 'Full video MediaConvert transcoding started successfully.'
     };
   }
@@ -1477,6 +1685,22 @@ class VideoService {
       };
     }
 
+    // If still PROCESSING with an active job, reuse — do NOT CreateJob again
+    const videoCompressor = require('./video.compressor');
+    const { COMPRESSION_SETTINGS } = require('./video.constants');
+    if (record.status === VIDEO_STATUS.PROCESSING && videoCompressor.isJobAlreadyActive(record, COMPRESSION_SETTINGS.JOB_TIMEOUT_MINUTES)) {
+      console.log(`ℹ️ [DUPLICATE_MEDIACONVERT_JOB_BLOCKED] Retry while PROCESSING reused job ${record.mediaconvert_job_id}`);
+      return {
+        status: 'SUCCESS',
+        videoAssetId: record.id,
+        jobId: record.mediaconvert_job_id,
+        processingStatus: VIDEO_STATUS.PROCESSING,
+        duplicated: true,
+        reason: 'ACTIVE_JOB_REUSED',
+        message: 'Active MediaConvert job already in progress. Retry did not create a new job.'
+      };
+    }
+
     const currentRetries = Number(record.retry_count) || 0;
     const updatedRecord = await this.upsertVideoRecord({
       ...record,
@@ -1497,7 +1721,8 @@ class VideoService {
       return this.startTopicBatchProcessing(adminUser, {
         moduleId: effectiveModId,
         courseId: effectiveCourseId,
-        sourceVideoId: updatedRecord.id
+        sourceVideoId: updatedRecord.id,
+        triggerSource: TRIGGER_SOURCES.RETRY
       });
     }
 
@@ -1506,7 +1731,10 @@ class VideoService {
       moduleId: effectiveModId,
       courseId: effectiveCourseId,
       videoAssetId: updatedRecord.id,
-      lessonId: updatedRecord.lesson_id
+      lessonId: updatedRecord.lesson_id,
+      adminOverride: false,
+      forceReprocess: false,
+      confirmReprocess: false
     });
   }
 
@@ -1625,6 +1853,13 @@ class VideoService {
     // Idempotency: Ignore duplicate completion events if already finalized
     if (record.status === VIDEO_STATUS.READY && record.compression_result) {
       console.log(`ℹ️ [Video Pipeline] Video ${record.lesson_id} is already finalized. Duplicate completion ignored.`);
+      await mediaConvertJobGuard.markClaimReady({ mediaconvertJobId: jobId, processingIdentity: record.processing_identity });
+      return;
+    }
+
+    // Job ID validation — ignore stale/mismatched completion callbacks
+    if (jobId && record.mediaconvert_job_id && String(jobId) !== String(record.mediaconvert_job_id)) {
+      console.warn(`⚠️ [Video Pipeline] Ignoring completion for mismatched jobId ${jobId} (record has ${record.mediaconvert_job_id})`);
       return;
     }
 
@@ -1855,6 +2090,7 @@ class VideoService {
     }
 
     console.log(`✅ [Video Pipeline] Lesson ${record.lesson_id} is now READY with HLS stream: ${effectivePlaybackUrl} (Qualities: ${availableQualities.join(', ')})`);
+    await mediaConvertJobGuard.markClaimReady({ mediaconvertJobId: jobId, processingIdentity: record.processing_identity });
   }
 
   /**
@@ -1863,6 +2099,16 @@ class VideoService {
   async handleProcessingFailed({ jobId, videoAssetId, lessonId, errorDetails }) {
     const record = await this.getVideoRecord(videoAssetId || lessonId);
     if (!record || ['DELETING', 'DELETED', 'CANCELLING', 'CANCELED'].includes(record.status)) {
+      return;
+    }
+
+    // Do not roll READY back to FAILED on stale/duplicate failure callbacks
+    if (record.status === VIDEO_STATUS.READY) {
+      console.warn(`⚠️ [Video Pipeline] Ignoring failure callback for already READY video ${record.id} job=${jobId}`);
+      return;
+    }
+    if (jobId && record.mediaconvert_job_id && String(jobId) !== String(record.mediaconvert_job_id)) {
+      console.warn(`⚠️ [Video Pipeline] Ignoring mismatched failure jobId ${jobId} (record has ${record.mediaconvert_job_id})`);
       return;
     }
 
@@ -1884,6 +2130,10 @@ class VideoService {
       error_code: errorDetails?.code || 'TRANSCODE_ERROR',
       error_message: errorDetails?.message || 'MediaConvert transcoding failed.',
       updated_at: new Date().toISOString()
+    });
+    await mediaConvertJobGuard.markClaimFailed({
+      mediaconvertJobId: jobId || record.mediaconvert_job_id,
+      errorMessage: errorDetails?.message || 'MediaConvert transcoding failed.'
     });
   }
 
@@ -2071,15 +2321,29 @@ class VideoService {
 
     const isTopicMode = !!(topicsSummary && topicsSummary.totalTopics > 0);
     let effectiveStatus = record.status;
+    const recordIsLiveEncode = ['PROCESSING', 'UPLOADING', 'QUEUED'].includes(String(record.status || ''))
+      && Boolean(record.mediaconvert_job_id);
+
     if (isTopicMode) {
       if (topicsSummary.totalTopics > 0 && topicsSummary.readyTopics === topicsSummary.totalTopics) {
         effectiveStatus = VIDEO_STATUS.READY;
       } else if (topicsSummary.processingTopics > 0 || topicsSummary.queuedTopics > 0) {
         effectiveStatus = VIDEO_STATUS.PROCESSING;
+      } else if (recordIsLiveEncode) {
+        // Mode 1 master (or module) MediaConvert still running — do not collapse to DRAFT/SEGMENTATION
+        effectiveStatus = record.status;
       } else if (topicsSummary.failedTopics > 0 && topicsSummary.readyTopics === 0 && topicsSummary.processingTopics === 0 && topicsSummary.queuedTopics === 0) {
         effectiveStatus = VIDEO_STATUS.FAILED;
       } else if (topicsSummary.readyTopics === 0 && topicsSummary.processingTopics === 0 && topicsSummary.queuedTopics === 0 && topicsSummary.failedTopics === 0) {
-        effectiveStatus = 'DRAFT';
+        effectiveStatus = record.status === VIDEO_STATUS.PROCESSING ? VIDEO_STATUS.PROCESSING : 'DRAFT';
+      } else if (
+        topicsSummary.readyTopics > 0 &&
+        topicsSummary.readyTopics < topicsSummary.totalTopics &&
+        topicsSummary.processingTopics === 0 &&
+        topicsSummary.queuedTopics === 0
+      ) {
+        // Partial clips done, nothing encoding, no live master job — wait for admin
+        effectiveStatus = VIDEO_STATUS.SEGMENTATION_REQUIRED;
       }
     }
 
@@ -3109,7 +3373,7 @@ class VideoService {
    * 12. Start Controlled Topic Batch Transcoding Dispatcher
    * Enforces MAX_CONCURRENT_TRANSCODING_JOBS limit without unbounded Promise.all
    */
-  async startTopicBatchProcessing(adminUser, { moduleId, courseId, sourceVideoId, topicIds, maxConcurrent, forceReset = false }) {
+  async startTopicBatchProcessing(adminUser, { moduleId, courseId, sourceVideoId, topicIds, maxConcurrent, forceReset = false, adminOverride = false, triggerSource = TRIGGER_SOURCES.TOPIC_CLIPPING }) {
     const s3PathUtils = require('../../utils/s3PathUtils');
     const { COMPRESSION_SETTINGS } = require('./video.constants');
     const MAX_CONCURRENT_JOBS = maxConcurrent || Number(process.env.MAX_CONCURRENT_TRANSCODING_JOBS) || 3;
@@ -3183,6 +3447,7 @@ class VideoService {
     const courseSlug = s3PathUtils.generateS3CourseSlug(course);
     const moduleSlug = s3PathUtils.generateS3ModuleSlug(moduleId);
     const cdnDomain = env.CLOUDFRONT_DOMAIN || `https://${env.AWS_S3_BUCKET_OUTPUT}.s3.${env.AWS_REGION}.amazonaws.com`;
+    const sourceMetrics = await videoSourceProbe.resolveSourceMetrics(sourceRecord);
 
     // Sanitize topic boundaries against actual source video duration
     const sourceDuration = sourceRecord.duration_seconds || sourceRecord.source_duration_seconds || 0;
@@ -3256,27 +3521,67 @@ class VideoService {
         currentlyRunning++;
         const topicHlsPrefix = s3PathUtils.buildS3TopicHlsPrefix(courseSlug, moduleSlug, sourceRecord.id, topic.id);
         const masterUrl = `${cdnDomain}/${topicHlsPrefix}master.m3u8`;
+        const clipDuration = Math.max(0, Number(topic.end_time_seconds || 0) - Number(topic.start_time_seconds || 0));
 
         try {
-          const jobResult = await mediaConvertVideoService.submitTopicClippingJob({
-            sourceBucket: effectiveBucket,
+          const guarded = await this.submitGuardedMediaConvertJob({
+            processingProfile: PROCESSING_PROFILES.TOPIC_CLIPPING,
+            videoId: sourceRecord.id,
+            uploadId: sourceRecord.upload_id || sourceRecord.source_s3_key,
+            courseId: course?.id || sourceRecord.course_id,
+            moduleId,
+            topicId: topic.id,
             sourceKey: effectiveKey,
-            outputPrefix: topicHlsPrefix,
-            startTimeSeconds: topic.start_time_seconds,
-            endTimeSeconds: topic.end_time_seconds,
-            startTimecode: topic.start_timecode,
-            endTimecode: topic.end_timecode,
-            fps: sourceRecord.source_fps || 30,
-            sourceHeight: sourceRecord.source_height || sourceRecord.height,
-            sourceWidth: sourceRecord.source_width || sourceRecord.width,
-            userMetadata: {
-              topicId: String(topic.id),
-              sourceVideoId: String(sourceRecord.id),
-              moduleId: String(moduleId),
-              courseId: String(course?.id || sourceRecord.course_id),
-              isTopicClip: 'true'
+            sourceDurationSeconds: clipDuration || sourceDuration,
+            sourceWidth: sourceMetrics.width || sourceRecord.source_width || sourceRecord.width,
+            sourceHeight: sourceMetrics.height || sourceRecord.source_height || sourceRecord.height,
+            triggerSource: triggerSource || TRIGGER_SOURCES.TOPIC_QUEUE,
+            adminOverride,
+            existingTopic: topic,
+            existingRecord: sourceRecord,
+            submitFn: async ({ requestedOutputs, sourceHeight, sourceWidth }) => {
+              return mediaConvertVideoService.submitTopicClippingJob({
+                sourceBucket: effectiveBucket,
+                sourceKey: effectiveKey,
+                outputPrefix: topicHlsPrefix,
+                startTimeSeconds: topic.start_time_seconds,
+                endTimeSeconds: topic.end_time_seconds,
+                startTimecode: topic.start_timecode,
+                endTimecode: topic.end_timecode,
+                fps: sourceRecord.source_fps || 30,
+                sourceHeight,
+                sourceWidth,
+                requestedOutputs,
+                userMetadata: {
+                  topicId: String(topic.id),
+                  sourceVideoId: String(sourceRecord.id),
+                  moduleId: String(moduleId),
+                  courseId: String(course?.id || sourceRecord.course_id),
+                  isTopicClip: 'true',
+                  processingProfile: PROCESSING_PROFILES.TOPIC_CLIPPING
+                }
+              });
             }
           });
+
+          if (guarded.duplicated) {
+            console.log(`ℹ️ [DUPLICATE_MEDIACONVERT_JOB_BLOCKED] Topic ${topic.id}: ${guarded.reason} job=${guarded.jobId}`);
+            if (guarded.jobId) {
+              dispatchedJobs.push({
+                topicId: topic.id,
+                title: topic.title,
+                jobId: guarded.jobId,
+                status: topic.processing_status === 'READY' ? 'READY' : 'PROCESSING',
+                duplicated: true,
+                reason: guarded.reason
+              });
+            } else {
+              currentlyRunning--;
+            }
+            continue;
+          }
+
+          const jobResult = guarded.jobResult;
 
           const activeTopic = {
             ...topic,
@@ -3284,6 +3589,8 @@ class VideoService {
             processing_status: 'PROCESSING',
             hls_prefix: topicHlsPrefix,
             hls_master_url: masterUrl,
+            processing_identity: guarded.processingIdentity,
+            processing_profile: guarded.processingProfile,
             processing_started_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
           };
@@ -3295,6 +3602,8 @@ class VideoService {
               processing_status: 'PROCESSING',
               hls_prefix: topicHlsPrefix,
               hls_master_url: masterUrl,
+              processing_identity: guarded.processingIdentity,
+              processing_profile: guarded.processingProfile,
               processing_started_at: new Date().toISOString(),
               updated_at: new Date().toISOString()
             }).eq('id', topic.id);
@@ -3310,6 +3619,7 @@ class VideoService {
 
           console.log(`🚀 [TOPIC_JOB_CREATED] Topic ${topic.title} (TopicId: ${topic.id}, JobId: ${jobResult.jobId}, ModuleId: ${moduleId}, Status: PROCESSING)`);
         } catch (jobErr) {
+          currentlyRunning--;
           console.error(`❌ [Topic Dispatch Error] Failed to submit job for topic ${topic.id}:`, jobErr.message);
           memoryVideoStore.set(`topic_${topic.id}`, {
             ...topic,
@@ -3325,6 +3635,8 @@ class VideoService {
       ...sourceRecord,
       is_topic_split: true,
       status: 'PROCESSING',
+      source_width: sourceMetrics.width || sourceRecord.source_width,
+      source_height: sourceMetrics.height || sourceRecord.source_height,
       updated_at: new Date().toISOString()
     });
 
@@ -3385,25 +3697,52 @@ class VideoService {
       }
 
       try {
-        const jobResult = await mediaConvertVideoService.submitTopicClippingJob({
-          sourceBucket: effectiveBucket,
+        const clipDuration = Math.max(0, Number(effectiveEndSec || 0) - Number(effectiveStartSec || 0));
+        const guarded = await this.submitGuardedMediaConvertJob({
+          processingProfile: PROCESSING_PROFILES.TOPIC_CLIPPING,
+          videoId: sourceRecord.id,
+          uploadId: sourceRecord.upload_id || sourceRecord.source_s3_key,
+          courseId: course?.id || sourceRecord.course_id,
+          moduleId: sourceRecord.module_id || moduleId,
+          topicId: topic.id,
           sourceKey: sourceRecord.source_s3_key,
-          outputPrefix: topicHlsPrefix,
-          startTimeSeconds: effectiveStartSec,
-          endTimeSeconds: effectiveEndSec,
-          startTimecode: topic.start_timecode,
-          endTimecode: topic.end_timecode,
-          fps: sourceRecord.source_fps || 30,
-          sourceHeight: sourceRecord.source_height || sourceRecord.height,
+          sourceDurationSeconds: clipDuration || sourceDuration,
           sourceWidth: sourceRecord.source_width || sourceRecord.width,
-          userMetadata: {
-            topicId: String(topic.id),
-            sourceVideoId: String(sourceRecord.id),
-            moduleId: String(sourceRecord.module_id || moduleId),
-            courseId: String(course?.id || sourceRecord.course_id),
-            isTopicClip: 'true'
+          sourceHeight: sourceRecord.source_height || sourceRecord.height,
+          triggerSource: TRIGGER_SOURCES.TOPIC_QUEUE,
+          existingTopic: topic,
+          existingRecord: sourceRecord,
+          submitFn: async ({ requestedOutputs, sourceHeight, sourceWidth }) => {
+            return mediaConvertVideoService.submitTopicClippingJob({
+              sourceBucket: effectiveBucket,
+              sourceKey: sourceRecord.source_s3_key,
+              outputPrefix: topicHlsPrefix,
+              startTimeSeconds: effectiveStartSec,
+              endTimeSeconds: effectiveEndSec,
+              startTimecode: topic.start_timecode,
+              endTimecode: topic.end_timecode,
+              fps: sourceRecord.source_fps || 30,
+              sourceHeight,
+              sourceWidth,
+              requestedOutputs,
+              userMetadata: {
+                topicId: String(topic.id),
+                sourceVideoId: String(sourceRecord.id),
+                moduleId: String(sourceRecord.module_id || moduleId),
+                courseId: String(course?.id || sourceRecord.course_id),
+                isTopicClip: 'true',
+                processingProfile: PROCESSING_PROFILES.TOPIC_CLIPPING
+              }
+            });
           }
         });
+
+        if (guarded.duplicated) {
+          console.log(`ℹ️ [DUPLICATE_MEDIACONVERT_JOB_BLOCKED] Queue dispatch topic ${topic.id}: ${guarded.reason}`);
+          continue;
+        }
+
+        const jobResult = guarded.jobResult;
 
         const activeTopic = {
           ...topic,
@@ -3411,6 +3750,7 @@ class VideoService {
           processing_status: 'PROCESSING',
           hls_prefix: topicHlsPrefix,
           hls_master_url: masterUrl,
+          processing_identity: guarded.processingIdentity,
           processing_started_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         };
@@ -3422,6 +3762,7 @@ class VideoService {
             processing_status: 'PROCESSING',
             hls_prefix: topicHlsPrefix,
             hls_master_url: masterUrl,
+            processing_identity: guarded.processingIdentity,
             processing_started_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
           }).eq('id', topic.id);
@@ -3444,6 +3785,23 @@ class VideoService {
    */
   async handleTopicProcessingCompleted({ jobId, topicId, sourceVideoId, moduleId, courseId, jobSubmittedTime, jobStartedTime, jobFinishedTime, isIndividualTopicVideo = false }) {
     console.log(`✅ [TOPIC_JOB_COMPLETED] Topic ${topicId} (JobId: ${jobId}, ModuleId: ${moduleId}, Status: READY, Individual: ${isIndividualTopicVideo}) completed successfully.`);
+
+    let earlyTopic = memoryVideoStore.get(`topic_${topicId}`);
+    if (!earlyTopic) {
+      try {
+        const { data } = await supabase.from('topics').select('processing_status, mediaconvert_job_id, processing_identity').eq('id', topicId).maybeSingle();
+        earlyTopic = data;
+      } catch (e) {}
+    }
+    if (earlyTopic?.processing_status === 'READY') {
+      console.log(`ℹ️ [Topic Pipeline] Topic ${topicId} already READY. Duplicate completion ignored.`);
+      await mediaConvertJobGuard.markClaimReady({ mediaconvertJobId: jobId, processingIdentity: earlyTopic.processing_identity });
+      return;
+    }
+    if (jobId && earlyTopic?.mediaconvert_job_id && String(jobId) !== String(earlyTopic.mediaconvert_job_id)) {
+      console.warn(`⚠️ [Topic Pipeline] Ignoring mismatched completion jobId ${jobId} for topic ${topicId}`);
+      return;
+    }
 
     // Compute Telemetry Metrics: T_queue, T_encode, T_total
     let queueWaitSeconds = null;
@@ -3535,6 +3893,10 @@ class VideoService {
     };
 
     memoryVideoStore.set(`topic_${topicId}`, updatedTopic);
+    await mediaConvertJobGuard.markClaimReady({
+      mediaconvertJobId: jobId,
+      processingIdentity: updatedTopic.processing_identity || dbTopic?.processing_identity || earlyTopic?.processing_identity
+    });
 
     try {
       const { error: topErr } = await supabase.from('topics').update({
@@ -3747,25 +4109,74 @@ class VideoService {
 
     console.log(`🔄 [Topic Retry] Retrying single topic ${topic.title} (${topic.start_timecode}-${topic.end_timecode})...`);
 
-    const jobResult = await mediaConvertVideoService.submitTopicClippingJob({
-      sourceBucket: effectiveBucket,
+    // Reuse active job if still PROCESSING
+    if (topic.processing_status === 'PROCESSING' && topic.mediaconvert_job_id) {
+      console.log(`ℹ️ [DUPLICATE_MEDIACONVERT_JOB_BLOCKED] Topic retry while PROCESSING reused job ${topic.mediaconvert_job_id}`);
+      return {
+        status: 'SUCCESS',
+        topicId: topic.id,
+        jobId: topic.mediaconvert_job_id,
+        processingStatus: 'PROCESSING',
+        duplicated: true,
+        reason: 'ACTIVE_JOB_REUSED',
+        message: `Topic '${topic.title}' already has an active MediaConvert job.`
+      };
+    }
+
+    const clipDuration = Math.max(0, Number(topic.end_time_seconds || 0) - Number(topic.start_time_seconds || 0));
+    const guarded = await this.submitGuardedMediaConvertJob({
+      processingProfile: PROCESSING_PROFILES.TOPIC_CLIPPING,
+      videoId: sourceRecord.id,
+      uploadId: sourceRecord.upload_id || sourceRecord.source_s3_key,
+      courseId: course?.id || sourceRecord.course_id,
+      moduleId: topic.module_id,
+      topicId: topic.id,
       sourceKey: sourceRecord.source_s3_key,
-      outputPrefix: topicHlsPrefix,
-      startTimeSeconds: topic.start_time_seconds,
-      endTimeSeconds: topic.end_time_seconds,
-      startTimecode: topic.start_timecode,
-      endTimecode: topic.end_timecode,
-      fps: sourceRecord?.source_fps || 30,
-      sourceHeight: sourceRecord?.source_height || sourceRecord?.height,
+      sourceDurationSeconds: clipDuration,
       sourceWidth: sourceRecord?.source_width || sourceRecord?.width,
-      userMetadata: {
-        topicId: String(topic.id),
-        sourceVideoId: String(sourceRecord?.id || topic.source_video_id),
-        moduleId: String(topic.module_id),
-        courseId: String(course?.id || sourceRecord?.course_id),
-        isTopicClip: 'true'
+      sourceHeight: sourceRecord?.source_height || sourceRecord?.height,
+      triggerSource: TRIGGER_SOURCES.RETRY,
+      existingTopic: topic,
+      existingRecord: sourceRecord,
+      isRetry: true,
+      submitFn: async ({ requestedOutputs, sourceHeight, sourceWidth }) => {
+        return mediaConvertVideoService.submitTopicClippingJob({
+          sourceBucket: effectiveBucket,
+          sourceKey: sourceRecord.source_s3_key,
+          outputPrefix: topicHlsPrefix,
+          startTimeSeconds: topic.start_time_seconds,
+          endTimeSeconds: topic.end_time_seconds,
+          startTimecode: topic.start_timecode,
+          endTimecode: topic.end_timecode,
+          fps: sourceRecord?.source_fps || 30,
+          sourceHeight,
+          sourceWidth,
+          requestedOutputs,
+          userMetadata: {
+            topicId: String(topic.id),
+            sourceVideoId: String(sourceRecord?.id || topic.source_video_id),
+            moduleId: String(topic.module_id),
+            courseId: String(course?.id || sourceRecord?.course_id),
+            isTopicClip: 'true',
+            processingProfile: PROCESSING_PROFILES.TOPIC_CLIPPING
+          }
+        });
       }
     });
+
+    if (guarded.duplicated) {
+      return {
+        status: 'SUCCESS',
+        topicId: topic.id,
+        jobId: guarded.jobId,
+        processingStatus: topic.processing_status === 'READY' ? 'READY' : 'PROCESSING',
+        duplicated: true,
+        reason: guarded.reason,
+        message: `Topic '${topic.title}' retry blocked — existing job/output reused.`
+      };
+    }
+
+    const jobResult = guarded.jobResult;
 
     const activeTopic = {
       ...topic,
@@ -3774,6 +4185,7 @@ class VideoService {
       processing_error: null,
       hls_prefix: topicHlsPrefix,
       hls_master_url: masterUrl,
+      processing_identity: guarded.processingIdentity,
       updated_at: new Date().toISOString()
     };
 
@@ -3785,6 +4197,7 @@ class VideoService {
         processing_error: null,
         hls_prefix: topicHlsPrefix,
         hls_master_url: masterUrl,
+        processing_identity: guarded.processingIdentity,
         updated_at: new Date().toISOString()
       }).eq('id', topic.id);
     } catch (e) {}
@@ -4116,21 +4529,59 @@ class VideoService {
     const moduleSlug = s3PathUtils.generateS3ModuleSlug(targetMod, modIdx + 1);
     const topicHlsPrefix = s3PathUtils.buildS3TopicHlsPrefix(courseSlug, moduleSlug, videoAssetId, cleanTopicId);
 
-    // 2. Submit MediaConvert HLS Transcode Job (Single job for this topic)
-    const jobResult = await mediaConvertVideoService.submitTranscodeJob({
-      sourceBucket: completeResult.s3Bucket || s3VideoService.sourceBucket || env.AWS_S3_RAW_BUCKET || env.AWS_S3_BUCKET_SOURCE || 'internnetra-lms-videos-prod-365957110532-ap-south-1-an',
+    const existingVideo = await this.getVideoRecord(videoAssetId).catch(() => null);
+    const metrics = await videoSourceProbe.resolveSourceMetrics(existingVideo || { duration_seconds: parsedDuration });
+
+    // 2. Submit MediaConvert HLS Transcode Job (guarded — Mode 2 DIRECT_TOPIC_HLS)
+    const guarded = await this.submitGuardedMediaConvertJob({
+      processingProfile: PROCESSING_PROFILES.DIRECT_TOPIC_HLS,
+      videoId: videoAssetId,
+      uploadId: uploadId || s3Key,
+      courseId: course.id,
+      moduleId: String(targetMod.id || moduleId),
+      topicId: cleanTopicId,
       sourceKey: s3Key,
-      outputPrefix: topicHlsPrefix,
-      userMetadata: {
-        isTopicJob: 'true',
-        topicId: cleanTopicId,
-        sourceVideoId: String(videoAssetId),
-        videoAssetId: String(videoAssetId),
-        moduleId: String(targetMod.id || moduleId),
-        courseId: String(course.id),
-        isIndividualTopicVideo: 'true'
+      sourceDurationSeconds: parsedDuration || metrics.durationSeconds,
+      sourceWidth: metrics.width,
+      sourceHeight: metrics.height,
+      triggerSource: TRIGGER_SOURCES.DIRECT_TOPIC_UPLOAD,
+      existingRecord: existingVideo,
+      existingTopic: targetTopic,
+      submitFn: async ({ requestedOutputs, sourceHeight, sourceWidth }) => {
+        return mediaConvertVideoService.submitTranscodeJob({
+          sourceBucket: completeResult.s3Bucket || s3VideoService.sourceBucket || env.AWS_S3_RAW_BUCKET || env.AWS_S3_BUCKET_SOURCE || 'internnetra-lms-videos-prod-365957110532-ap-south-1-an',
+          sourceKey: s3Key,
+          outputPrefix: topicHlsPrefix,
+          requestedOutputs,
+          sourceHeight,
+          sourceWidth,
+          userMetadata: {
+            isTopicJob: 'true',
+            topicId: cleanTopicId,
+            sourceVideoId: String(videoAssetId),
+            videoAssetId: String(videoAssetId),
+            moduleId: String(targetMod.id || moduleId),
+            courseId: String(course.id),
+            isIndividualTopicVideo: 'true',
+            processingProfile: PROCESSING_PROFILES.DIRECT_TOPIC_HLS
+          }
+        });
       }
     });
+
+    if (guarded.duplicated) {
+      return {
+        status: 'SUCCESS',
+        jobId: guarded.jobId,
+        topicId: cleanTopicId,
+        videoAssetId,
+        processingStatus: existingVideo?.status === 'READY' ? 'READY' : 'PROCESSING',
+        duplicated: true,
+        reason: guarded.reason
+      };
+    }
+
+    const jobResult = guarded.jobResult;
 
     // 3. Update lesson_videos record to PROCESSING
     await this.upsertVideoRecord({
@@ -4143,6 +4594,10 @@ class VideoService {
       mediaconvert_job_id: jobResult.jobId,
       hls_prefix: topicHlsPrefix,
       duration_seconds: parsedDuration,
+      source_width: metrics.width,
+      source_height: metrics.height,
+      processing_identity: guarded.processingIdentity,
+      processing_profile: guarded.processingProfile,
       processing_started_at: new Date().toISOString()
     });
 
@@ -4157,6 +4612,7 @@ class VideoService {
       processing_status: 'PROCESSING',
       hls_prefix: topicHlsPrefix,
       duration_seconds: parsedDuration,
+      processing_identity: guarded.processingIdentity,
       processing_started_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
     };
@@ -4170,6 +4626,7 @@ class VideoService {
         hls_prefix: topicHlsPrefix,
         video_asset_id: videoAssetId,
         duration_seconds: parsedDuration,
+        processing_identity: guarded.processingIdentity,
         processing_started_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
       }).eq('id', cleanTopicId);
@@ -4236,21 +4693,59 @@ class VideoService {
     const moduleSlug = s3PathUtils.generateS3ModuleSlug(targetMod, modIdx + 1);
     const topicHlsPrefix = s3PathUtils.buildS3TopicHlsPrefix(courseSlug, moduleSlug, videoAssetId, cleanTopicId);
 
-    // Submit MediaConvert HLS Transcode Job (Single job for this topic)
-    const jobResult = await mediaConvertVideoService.submitTranscodeJob({
-      sourceBucket: s3VideoService.sourceBucket || env.AWS_S3_RAW_BUCKET || env.AWS_S3_BUCKET_SOURCE || 'internnetra-lms-videos-prod-365957110532-ap-south-1-an',
+    const existingVideo = await this.getVideoRecord(videoAssetId).catch(() => null);
+    const metrics = await videoSourceProbe.resolveSourceMetrics(existingVideo || { duration_seconds: parsedDuration });
+
+    // Submit MediaConvert HLS Transcode Job (guarded — Mode 2 DIRECT_TOPIC_HLS)
+    const guarded = await this.submitGuardedMediaConvertJob({
+      processingProfile: PROCESSING_PROFILES.DIRECT_TOPIC_HLS,
+      videoId: videoAssetId,
+      uploadId: s3Key,
+      courseId: course.id,
+      moduleId: String(targetMod.id || moduleId),
+      topicId: cleanTopicId,
       sourceKey: s3Key,
-      outputPrefix: topicHlsPrefix,
-      userMetadata: {
-        isTopicJob: 'true',
-        topicId: cleanTopicId,
-        sourceVideoId: String(videoAssetId),
-        videoAssetId: String(videoAssetId),
-        moduleId: String(targetMod.id || moduleId),
-        courseId: String(course.id),
-        isIndividualTopicVideo: 'true'
+      sourceDurationSeconds: parsedDuration || metrics.durationSeconds,
+      sourceWidth: metrics.width,
+      sourceHeight: metrics.height,
+      triggerSource: TRIGGER_SOURCES.DIRECT_TOPIC_UPLOAD,
+      existingRecord: existingVideo,
+      existingTopic: targetTopic,
+      submitFn: async ({ requestedOutputs, sourceHeight, sourceWidth }) => {
+        return mediaConvertVideoService.submitTranscodeJob({
+          sourceBucket: s3VideoService.sourceBucket || env.AWS_S3_RAW_BUCKET || env.AWS_S3_BUCKET_SOURCE || 'internnetra-lms-videos-prod-365957110532-ap-south-1-an',
+          sourceKey: s3Key,
+          outputPrefix: topicHlsPrefix,
+          requestedOutputs,
+          sourceHeight,
+          sourceWidth,
+          userMetadata: {
+            isTopicJob: 'true',
+            topicId: cleanTopicId,
+            sourceVideoId: String(videoAssetId),
+            videoAssetId: String(videoAssetId),
+            moduleId: String(targetMod.id || moduleId),
+            courseId: String(course.id),
+            isIndividualTopicVideo: 'true',
+            processingProfile: PROCESSING_PROFILES.DIRECT_TOPIC_HLS
+          }
+        });
       }
     });
+
+    if (guarded.duplicated) {
+      return {
+        status: 'SUCCESS',
+        jobId: guarded.jobId,
+        topicId: cleanTopicId,
+        videoAssetId,
+        processingStatus: existingVideo?.status === 'READY' ? 'READY' : 'PROCESSING',
+        duplicated: true,
+        reason: guarded.reason
+      };
+    }
+
+    const jobResult = guarded.jobResult;
 
     // Update lesson_videos record to PROCESSING
     await this.upsertVideoRecord({
@@ -4263,6 +4758,10 @@ class VideoService {
       mediaconvert_job_id: jobResult.jobId,
       hls_prefix: topicHlsPrefix,
       duration_seconds: parsedDuration,
+      source_width: metrics.width,
+      source_height: metrics.height,
+      processing_identity: guarded.processingIdentity,
+      processing_profile: guarded.processingProfile,
       processing_started_at: new Date().toISOString()
     });
 
@@ -4277,6 +4776,7 @@ class VideoService {
       processing_status: 'PROCESSING',
       hls_prefix: topicHlsPrefix,
       duration_seconds: parsedDuration,
+      processing_identity: guarded.processingIdentity,
       processing_started_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
     };
@@ -4290,6 +4790,7 @@ class VideoService {
         hls_prefix: topicHlsPrefix,
         video_asset_id: videoAssetId,
         duration_seconds: parsedDuration,
+        processing_identity: guarded.processingIdentity,
         processing_started_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
       }).eq('id', cleanTopicId);
@@ -4392,8 +4893,18 @@ class VideoService {
     }
 
     if (!topic || topic.processing_status !== 'READY' || !topic.hls_master_url) {
-      if (parentModule?.video_url && parentModule.video_url.includes('.m3u8')) {
-        console.log(`ℹ️ [Topic Stream Auth] Falling back to parent module HLS video for module ${moduleId}`);
+      // Mode 2: individual topic videos — NEVER fall back to another topic or module video
+      const modeHint = String(parentModule?.video_content_mode || '').toUpperCase();
+      const isMode2 =
+        modeHint === 'INDIVIDUAL_TOPIC_VIDEOS' ||
+        modeHint === 'TOPIC_VIDEOS' ||
+        modeHint === 'MODE_2' ||
+        parentModule?.video_status === 'NO_VIDEO' ||
+        parentModule?.video_status === 'UNASSIGNED' ||
+        (!parentModule?.video_url && Boolean(topic?.video_asset_id || topic?.hls_prefix));
+
+      if (!isMode2 && parentModule?.video_url && parentModule.video_url.includes('.m3u8')) {
+        console.log(`ℹ️ [Topic Stream Auth] Mode 1 fallback to parent module HLS for module ${moduleId}`);
         return this.authorizeStudentPlayback(user, { courseId: effectiveCourseId, lessonId: moduleId });
       }
       if (topic?.processing_status === 'PROCESSING' || topic?.processing_status === 'QUEUED') {

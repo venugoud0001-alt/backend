@@ -1446,13 +1446,23 @@ class CurriculumService {
     let dbTopics = [];
     try {
       const [vRes, tRes] = await Promise.all([
-        supabase.from('lesson_videos').select('id, lesson_id, module_id, status, hls_master_url, duration_seconds').eq('course_id', course.id),
-        supabase.from('topics').select('id, module_id, title, duration_seconds, display_order, start_time_seconds, end_time_seconds, start_timecode, end_timecode, processing_status, hls_master_url, source_video_id').eq('course_id', course.id).order('display_order', { ascending: true })
+        supabase.from('lesson_videos').select('id, lesson_id, module_id, topic_id, status, hls_master_url, duration_seconds').eq('course_id', course.id),
+        supabase.from('topics').select('id, module_id, title, duration_seconds, display_order, start_time_seconds, end_time_seconds, start_timecode, end_timecode, processing_status, hls_master_url, source_video_id, video_asset_id').eq('course_id', course.id).order('display_order', { ascending: true })
       ]);
       dbLessonVideos = vRes.data || [];
       dbTopics = tRes.data || [];
     } catch (dbErr) {
-      console.warn('⚠️ [Curriculum Read] Notice fetching DB video telemetry:', dbErr.message);
+      // topic_id / video_asset_id columns may be absent on older schemas — retry with core columns
+      try {
+        const [vRes, tRes] = await Promise.all([
+          supabase.from('lesson_videos').select('id, lesson_id, module_id, status, hls_master_url, duration_seconds').eq('course_id', course.id),
+          supabase.from('topics').select('id, module_id, title, duration_seconds, display_order, start_time_seconds, end_time_seconds, start_timecode, end_timecode, processing_status, hls_master_url, source_video_id').eq('course_id', course.id).order('display_order', { ascending: true })
+        ]);
+        dbLessonVideos = vRes.data || [];
+        dbTopics = tRes.data || [];
+      } catch (retryErr) {
+        console.warn('⚠️ [Curriculum Read] Notice fetching DB video telemetry:', retryErr.message || dbErr.message);
+      }
     }
 
     const sortModuleFn = (a, b) => {
@@ -1467,6 +1477,69 @@ class CurriculumService {
       const orderB = b.display_order !== undefined && b.display_order !== null ? Number(b.display_order) : 999;
       if (orderA !== orderB) return orderA - orderB;
       return titleA.localeCompare(titleB, undefined, { numeric: true, sensitivity: 'base' });
+    };
+
+    // Resolve real topic length from topics + lesson_videos. Never invent a fake default (was 855s = 14m15s).
+    // Prefer lesson_videos when present — topics/JSON may still carry the old 855 sentinel.
+    const FAKE_TOPIC_DURATION_SECONDS = 855;
+    const isSyntheticTopicId = (id) => {
+      const s = String(id || '').trim();
+      if (!s) return true;
+      if (/^(top_|mod_|les_|bm_|topic_\d+)/i.test(s)) return true;
+      if (/^\d{1,6}$/.test(s)) return true;
+      return false;
+    };
+    const isUsableDuration = (sec) => {
+      const n = Number(sec) || 0;
+      return n > 0 && n !== FAKE_TOPIC_DURATION_SECONDS;
+    };
+
+    const findLessonVideoDuration = (mt, jsonTopic = null) => {
+      if (!mt && !jsonTopic) return 0;
+      const topicId = (!isSyntheticTopicId(mt?.id) ? mt?.id : null)
+        || (!isSyntheticTopicId(jsonTopic?.id) ? jsonTopic?.id : null)
+        || null;
+      const sourceVideoId = mt?.source_video_id || mt?.video_asset_id || jsonTopic?.source_video_id || jsonTopic?.video_asset_id || null;
+      const hlsUrl = mt?.hls_master_url || jsonTopic?.hls_master_url || null;
+      const videos = dbLessonVideos || [];
+      const match = videos.find((v) => {
+        if (!isUsableDuration(v.duration_seconds)) return false;
+        if (topicId && (String(v.topic_id || '') === String(topicId) || String(v.lesson_id || '') === String(topicId))) return true;
+        if (sourceVideoId && String(v.id) === String(sourceVideoId)) return true;
+        if (hlsUrl && v.hls_master_url && String(v.hls_master_url) === String(hlsUrl)) return true;
+        return false;
+      });
+      return Number(match?.duration_seconds) || 0;
+    };
+
+    const resolveTopicDurationSeconds = (mt, jsonTopic = null) => {
+      const fromVideo = findLessonVideoDuration(mt, jsonTopic);
+      if (fromVideo > 0) return fromVideo;
+
+      const startSec = Number(mt?.start_time_seconds ?? jsonTopic?.start_time_seconds) || 0;
+      const endSec = Number(mt?.end_time_seconds ?? jsonTopic?.end_time_seconds) || 0;
+      const clipDur = endSec > startSec ? (endSec - startSec) : 0;
+      // Mode 1 clips: real boundaries. Ignore clip if it equals the old fake default.
+      if (isUsableDuration(clipDur) && (startSec > 0 || endSec > 0)) return clipDur;
+
+      if (isUsableDuration(mt?.duration_seconds)) return Number(mt.duration_seconds);
+      if (isUsableDuration(jsonTopic?.duration_seconds)) return Number(jsonTopic.duration_seconds);
+
+      return 0;
+    };
+
+    const formatTopicDurationLabel = (durSec) => {
+      const sec = Number(durSec) || 0;
+      if (sec <= 0 || sec === FAKE_TOPIC_DURATION_SECONDS) return '';
+      const mins = Math.floor(sec / 60);
+      const remSec = Math.floor(sec % 60);
+      if (sec < 60) return `${sec}s`;
+      if (mins >= 60) {
+        const hrs = Math.floor(mins / 60);
+        const remMins = mins % 60;
+        return `${hrs}h${remMins ? ` ${remMins}m` : ''}`.trim();
+      }
+      return remSec > 0 ? `${mins} min ${remSec}s` : `${mins} min`;
     };
 
     // Helper to format JSON curriculum_modules if present
@@ -1633,11 +1706,11 @@ class CurriculumService {
             }
 
             const effectiveTitle = tTitle || (mt ? mt.title : `Topic ${tIdx + 1}`);
-            const durSec = (isExplicitlyNoVideo ? 0 : (mt?.duration_seconds || (isObj ? t.duration_seconds : 0))) || 855;
-            const durMins = Math.round(durSec / 60);
-            const formattedDur = durSec > 0 
-              ? (durSec >= 60 ? (durMins >= 60 ? `${Math.floor(durMins / 60)} hr ${durMins % 60 ? `${durMins % 60} min` : ''}`.trim() : `${durMins} mins`) : `${durSec}s`) 
-              : (isObj && t.duration ? t.duration : `${durMins || 14} mins`);
+            const durSec = isExplicitlyNoVideo ? 0 : resolveTopicDurationSeconds(mt, isObj ? t : null);
+            const durMins = durSec > 0 ? Math.round(durSec / 60) : 0;
+            const formattedDur = isExplicitlyNoVideo
+              ? '0s'
+              : formatTopicDurationLabel(durSec);
 
             const isTopicPreview = Boolean(
               (isObj && (t.is_preview || t.is_free_preview)) ||
@@ -1646,7 +1719,12 @@ class CurriculumService {
             );
 
             return {
-              id: tId || mt?.id || `top_${modIdStr}_${tIdx + 1}`,
+              // Prefer real DB UUID over synthetic JSON ids like top_1_3
+              id: (!isSyntheticTopicId(mt?.id) ? mt.id : null)
+                || (!isSyntheticTopicId(tId) ? tId : null)
+                || mt?.id
+                || tId
+                || `top_${modIdStr}_${tIdx + 1}`,
               title: effectiveTitle,
               name: effectiveTitle,
               display_order: tOrder,
@@ -1656,9 +1734,11 @@ class CurriculumService {
               end_timecode: isExplicitlyNoVideo ? '' : (mt?.end_timecode || (isObj ? (t.end_timecode || '') : '')),
               duration_seconds: isExplicitlyNoVideo ? 0 : durSec,
               duration: isExplicitlyNoVideo ? '0s' : formattedDur,
-              duration_minutes: isExplicitlyNoVideo ? 0 : (durMins || 14),
+              duration_minutes: isExplicitlyNoVideo ? 0 : durMins,
               processing_status: isExplicitlyNoVideo ? 'DRAFT' : (mt?.processing_status || (isObj ? t.processing_status : null) || 'DRAFT'),
               hls_master_url: isExplicitlyNoVideo ? null : (mt?.hls_master_url || (isObj ? t.hls_master_url : null) || null),
+              source_video_id: isExplicitlyNoVideo ? null : (mt?.source_video_id || (isObj ? t.source_video_id : null) || null),
+              video_asset_id: isExplicitlyNoVideo ? null : (mt?.video_asset_id || mt?.source_video_id || (isObj ? (t.video_asset_id || t.source_video_id) : null) || null),
               is_preview: isTopicPreview,
               is_free_preview: isTopicPreview
             };
@@ -1669,11 +1749,9 @@ class CurriculumService {
             for (let dbIdx = 0; dbIdx < sortedDbTopics.length; dbIdx++) {
               const mt = sortedDbTopics[dbIdx];
               if (mt && mt.id && !matchedDbTopicIds.has(mt.id)) {
-                const durSec = mt.duration_seconds || 0;
-                const durMins = Math.round(durSec / 60);
-                const formattedDur = durSec > 0 
-                  ? (durSec >= 60 ? (durMins >= 60 ? `${Math.floor(durMins / 60)} hr ${durMins % 60 ? `${durMins % 60} min` : ''}`.trim() : `${durMins} mins`) : `${durSec}s`) 
-                  : '14 mins';
+                const durSec = isExplicitlyNoVideo ? 0 : resolveTopicDurationSeconds(mt);
+                const durMins = durSec > 0 ? Math.round(durSec / 60) : 0;
+                const formattedDur = isExplicitlyNoVideo ? '0s' : formatTopicDurationLabel(durSec);
                 const isTopicPreview = Boolean(mt.is_preview || mt.is_free_preview);
 
                 mergedTopics.push({
@@ -1687,7 +1765,7 @@ class CurriculumService {
                   end_timecode: isExplicitlyNoVideo ? '' : (mt.end_timecode || ''),
                   duration_seconds: isExplicitlyNoVideo ? 0 : durSec,
                   duration: isExplicitlyNoVideo ? '0s' : formattedDur,
-                  duration_minutes: isExplicitlyNoVideo ? 0 : (durMins || 14),
+                  duration_minutes: isExplicitlyNoVideo ? 0 : durMins,
                   processing_status: isExplicitlyNoVideo ? 'DRAFT' : (mt.processing_status || 'DRAFT'),
                   hls_master_url: isExplicitlyNoVideo ? null : (mt.hls_master_url || null),
                   is_preview: isTopicPreview,
@@ -1699,11 +1777,9 @@ class CurriculumService {
         } else if (!isExplicitlyNoVideo && matchedTopics.length > 0) {
           const sortedDbTopics = [...matchedTopics].sort(sortTopicFn);
           mergedTopics = sortedDbTopics.map((mt, mtIdx) => {
-            const durSec = mt.duration_seconds || 0;
-            const durMins = Math.round(durSec / 60);
-            const formattedDur = durSec > 0 
-              ? (durSec >= 60 ? (durMins >= 60 ? `${Math.floor(durMins / 60)} hr ${durMins % 60 ? `${durMins % 60} min` : ''}`.trim() : `${durMins} mins`) : `${durSec}s`) 
-              : '14 mins';
+            const durSec = resolveTopicDurationSeconds(mt);
+            const durMins = durSec > 0 ? Math.round(durSec / 60) : 0;
+            const formattedDur = formatTopicDurationLabel(durSec);
             const isTopicPreview = Boolean(mt.is_preview || mt.is_free_preview);
 
             return {
@@ -1717,7 +1793,7 @@ class CurriculumService {
               end_timecode: mt.end_timecode || '',
               duration_seconds: durSec,
               duration: formattedDur,
-              duration_minutes: durMins || 14,
+              duration_minutes: durMins,
               processing_status: mt.processing_status || 'DRAFT',
               hls_master_url: mt.hls_master_url || null,
               is_preview: isTopicPreview,

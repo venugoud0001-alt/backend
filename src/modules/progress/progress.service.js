@@ -53,6 +53,7 @@ class ProgressService {
     courseId,
     moduleId,
     lessonId,
+    topicId = null,
     currentPositionSeconds = 0,
     totalDurationSeconds = 0,
     watchedDurationSeconds = 0,
@@ -175,6 +176,58 @@ class ProgressService {
       // Table might still be deploying migration; resilient memory store handles it
     }
 
+    // Topic-level completion (Mode 2): persist per-user per-topic without locking replay.
+    // Accept real UUIDs and stable synthetic curriculum ids (e.g. top_1_3) used by Mode 2 HLS paths.
+    let topicCompleted = false;
+    const rawTopicId = topicId != null ? String(topicId).trim() : '';
+    const cleanTopicId = rawTopicId && rawTopicId !== 'null' && rawTopicId !== 'undefined'
+      ? rawTopicId
+      : null;
+    if (cleanTopicId) {
+      const topicCacheKey = `${student.id}_topic_${cleanTopicId}`;
+      const prevTopicCache = memoryProgressStore.get(topicCacheKey) || {};
+      let existingTopicProg = null;
+      try {
+        const { data: dbTopicProg } = await supabase
+          .from('topic_video_progress')
+          .select('watched_position_seconds, watched_duration_seconds, completion_percent, is_completed, completed_at')
+          .eq('student_id', student.id)
+          .eq('topic_id', cleanTopicId)
+          .maybeSingle();
+        existingTopicProg = dbTopicProg;
+      } catch (e) {}
+
+      const topicMaxPercent = Math.max(completionPercent, prevTopicCache.completion_percent || 0, existingTopicProg?.completion_percent || 0);
+      const topicMaxWatched = Math.max(watched, prevTopicCache.watched_duration_seconds || 0, existingTopicProg?.watched_duration_seconds || 0);
+      topicCompleted = Boolean(isCompleted || prevTopicCache.is_completed || existingTopicProg?.is_completed || topicMaxPercent >= 90);
+      const topicCompletedAt = topicCompleted
+        ? (existingTopicProg?.completed_at || prevTopicCache.completed_at || new Date().toISOString())
+        : null;
+
+      const topicProgressPayload = {
+        student_id: student.id,
+        enrollment_id: enrollment?.id || null,
+        course_id: resolvedCourseId,
+        module_id: moduleId ? String(moduleId) : null,
+        topic_id: cleanTopicId,
+        watched_position_seconds: pos,
+        watched_duration_seconds: topicMaxWatched,
+        total_duration_seconds: total,
+        completion_percent: topicMaxPercent,
+        is_completed: topicCompleted,
+        completed_at: topicCompletedAt,
+        last_watched_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      };
+
+      memoryProgressStore.set(topicCacheKey, topicProgressPayload);
+      try {
+        await supabase
+          .from('topic_video_progress')
+          .upsert(topicProgressPayload, { onConflict: 'student_id,topic_id' });
+      } catch (topicDbErr) {}
+    }
+
     // 4. Sync with legacy lesson_progress table for backward compatibility
     if (moduleId && enrollment?.id) {
       try {
@@ -257,11 +310,13 @@ class ProgressService {
     return {
       status: 'SUCCESS',
       lessonId,
+      topicId: cleanTopicId,
       currentPositionSeconds: pos,
       watchedPositionSeconds: pos,
       watchedDurationSeconds: maxWatched,
       completionPercent: maxPercent,
       isCompleted: finalCompleted,
+      topicCompleted: cleanTopicId ? topicCompleted : undefined,
       courseProgress,
       completedLessons: completedLessonsCount,
       totalLessons: totalLessonsCount,
@@ -307,9 +362,42 @@ class ProgressService {
       if (p.module_id) progressMap.set(String(p.module_id), p);
     });
 
+    // Topic-level completions (Mode 2 ticks)
+    const topicCompletionsMap = {};
+    const topicModuleMap = {};
+    try {
+      const { data: topicProgRows } = await supabase
+        .from('topic_video_progress')
+        .select('topic_id, module_id, is_completed, completion_percent, course_id')
+        .eq('student_id', student.id);
+      (topicProgRows || []).forEach((row) => {
+        if (!row?.topic_id) return;
+        if (row.course_id && String(row.course_id) !== String(course.id)) return;
+        topicCompletionsMap[String(row.topic_id)] = {
+          isCompleted: Boolean(row.is_completed),
+          completionPercent: Number(row.completion_percent) || 0
+        };
+        if (row.module_id) topicModuleMap[String(row.topic_id)] = String(row.module_id);
+      });
+    } catch (e) {}
+
+    // Merge in-memory topic completions
+    for (const [k, v] of memoryProgressStore.entries()) {
+      if (k.startsWith(`${student.id}_topic_`) && v?.topic_id) {
+        const tid = String(v.topic_id);
+        if (!topicCompletionsMap[tid] || v.is_completed) {
+          topicCompletionsMap[tid] = {
+            isCompleted: Boolean(v.is_completed),
+            completionPercent: Number(v.completion_percent) || 0
+          };
+        }
+        if (v.module_id) topicModuleMap[tid] = String(v.module_id);
+      }
+    }
+
     // Merge in-memory cache entries
     for (const [k, v] of memoryProgressStore.entries()) {
-      if (k.startsWith(`${student.id}_`)) {
+      if (k.startsWith(`${student.id}_`) && !k.includes('_topic_')) {
         const lesId = k.slice(student.id.length + 1);
         if (!progressMap.has(lesId) || v.is_completed) {
           progressMap.set(lesId, v);
@@ -336,6 +424,22 @@ class ProgressService {
         ? m.topics
         : (Array.isArray(m.lessons) ? m.lessons : []);
 
+      const topicCompletions = {};
+      rawTopics.forEach((t) => {
+        const tid = typeof t === 'object' && t !== null ? t.id : null;
+        if (tid && topicCompletionsMap[String(tid)]) {
+          topicCompletions[String(tid)] = topicCompletionsMap[String(tid)];
+        }
+      });
+      // Include completions recorded for this module (Mode 2 synthetic ids like top_1_3)
+      Object.entries(topicCompletionsMap).forEach(([tid, val]) => {
+        if (!val?.isCompleted) return;
+        const rowMod = topicModuleMap[tid];
+        if (rowMod && String(rowMod) === modId) {
+          topicCompletions[tid] = val;
+        }
+      });
+
       return {
         moduleId: m.id || idx + 1,
         title: m.title || m.name || `Module ${idx + 1}`,
@@ -343,6 +447,7 @@ class ProgressService {
         isCompleted: isComp,
         completionPercent: prog?.completion_percent || 0,
         lastPositionSeconds: prog?.watched_position_seconds || 0,
+        topicCompletions,
         topics: rawTopics.map((t, tIdx) => typeof t === "string" ? t : (t?.title || t?.name || `Topic ${tIdx + 1}`)).filter(Boolean)
       };
     });

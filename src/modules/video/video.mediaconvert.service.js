@@ -1,11 +1,12 @@
 /**
- * AWS MediaConvert Service for HLS Adaptive Transcoding (720p & 1080p only)
- * 100% Production AWS SDK - No Mock Mode
+ * AWS MediaConvert Service for HLS Adaptive Transcoding
+ * Cost-optimized: H.264 + QVBR + SINGLE_PASS + no acceleration (Basic tier)
+ * Resolution-aware: never upscale; never exceed configured production max (1080p)
  */
 
 const { MediaConvertClient, CreateJobCommand, GetJobCommand, CancelJobCommand } = require('@aws-sdk/client-mediaconvert');
 const env = require('../../config/env');
-const { HLS_OUTPUT_SETTINGS, COMPRESSION_SETTINGS } = require('./video.constants');
+const { HLS_OUTPUT_SETTINGS, COMPRESSION_SETTINGS, COST_GUARD_SETTINGS } = require('./video.constants');
 
 class MediaConvertVideoService {
   constructor() {
@@ -25,11 +26,152 @@ class MediaConvertVideoService {
   }
 
   /**
-   * Generates MediaConvert job parameters for 720p & 1080p HLS output
+   * Acceleration PREFERRED/ENABLED forces Professional-tier billing.
+   * Only attach AccelerationSettings when explicitly enabled via env.
    */
-  buildJobSettings({ sourceBucket, sourceKey, outputPrefix }) {
+  buildAccelerationSettings() {
+    const mode = String(
+      COST_GUARD_SETTINGS.ACCELERATION_MODE ||
+      COMPRESSION_SETTINGS.ACCELERATION_MODE ||
+      'DISABLED'
+    ).toUpperCase();
+
+    if (mode === 'DISABLED' || mode === 'OFF' || mode === 'NONE') {
+      return null;
+    }
+
+    if (mode === 'PREFERRED' || mode === 'ENABLED') {
+      console.warn(
+        `⚠️ [MediaConvert] AccelerationMode=${mode} forces PROFESSIONAL tier billing. ` +
+        `Set VIDEO_ACCELERATION_MODE=DISABLED for Basic-tier H.264 HLS.`
+      );
+      return { Mode: mode === 'ENABLED' ? 'ENABLED' : 'PREFERRED' };
+    }
+
+    return null;
+  }
+
+  /**
+   * Resolve renditions from source dimensions. Never upscale. Cap at max height (1080).
+   */
+  resolveRenditions({ sourceHeight, sourceWidth, requestedOutputs }) {
+    if (Array.isArray(requestedOutputs) && requestedOutputs.length > 0) {
+      return requestedOutputs;
+    }
+
+    const h = Number(sourceHeight) || 0;
+    const w = Number(sourceWidth) || 0;
+    const maxOut = COST_GUARD_SETTINGS.MAX_OUTPUT_HEIGHT || 1080;
+
+    if (h >= 1080 || (h === 0 && w >= 1920)) {
+      return maxOut >= 1080 ? ['720p', '1080p'] : ['720p'];
+    }
+    if (h >= 720 || w >= 1280) {
+      return ['720p'];
+    }
+    if (h > 0 || w > 0) {
+      return ['480p'];
+    }
+    return ['720p'];
+  }
+
+  buildH264Output({ nameModifier, width, height, maxBitrate, qvbrLevel, audioBitrate, codecProfile = 'MAIN' }) {
+    return {
+      ContainerSettings: { Container: 'M3U8' },
+      NameModifier: nameModifier,
+      VideoDescription: {
+        Width: width,
+        Height: height,
+        ScalingBehavior: 'DEFAULT',
+        CodecSettings: {
+          Codec: 'H_264',
+          H264Settings: {
+            RateControlMode: 'QVBR',
+            QvbrSettings: { QvbrQualityLevel: qvbrLevel },
+            QualityTuningLevel: COMPRESSION_SETTINGS?.QUALITY_TUNING_LEVEL || 'SINGLE_PASS',
+            MaxBitrate: maxBitrate,
+            CodecProfile: codecProfile,
+            CodecLevel: 'AUTO',
+            InterlaceMode: 'PROGRESSIVE',
+            FramerateControl: 'INITIALIZE_FROM_SOURCE',
+            GopSize: 60,
+            GopSizeUnits: 'FRAMES',
+            GopClosedCadence: 1,
+            NumberBFramesBetweenReferenceFrames: 2,
+            SceneChangeDetect: 'TRANSITION_DETECTION'
+          }
+        }
+      },
+      AudioDescriptions: [
+        {
+          CodecSettings: {
+            Codec: 'AAC',
+            AacSettings: {
+              Bitrate: audioBitrate,
+              CodingMode: 'CODING_MODE_2_0',
+              SampleRate: 48000
+            }
+          }
+        }
+      ]
+    };
+  }
+
+  buildOutputsForRenditions(renditions) {
+    const outputs = [];
+    for (const r of renditions) {
+      if (r === '480p') {
+        outputs.push(this.buildH264Output({
+          nameModifier: '_480p',
+          width: 854,
+          height: 480,
+          maxBitrate: COMPRESSION_SETTINGS?.MAX_BITRATE_480P || 800000,
+          qvbrLevel: COMPRESSION_SETTINGS?.QUALITY_480P_QVBR || 7,
+          audioBitrate: COMPRESSION_SETTINGS?.AUDIO_BITRATE_480P || 64000,
+          codecProfile: 'MAIN'
+        }));
+      } else if (r === '720p') {
+        outputs.push(this.buildH264Output({
+          nameModifier: '_720p',
+          width: 1280,
+          height: 720,
+          maxBitrate: COMPRESSION_SETTINGS?.MAX_BITRATE_720P || 1400000,
+          qvbrLevel: COMPRESSION_SETTINGS?.QUALITY_720P_QVBR || 7,
+          audioBitrate: COMPRESSION_SETTINGS?.AUDIO_BITRATE_720P || 96000,
+          codecProfile: 'MAIN'
+        }));
+      } else if (r === '1080p') {
+        outputs.push(this.buildH264Output({
+          nameModifier: '_1080p',
+          width: 1920,
+          height: 1080,
+          maxBitrate: COMPRESSION_SETTINGS?.MAX_BITRATE_1080P || 2800000,
+          qvbrLevel: COMPRESSION_SETTINGS?.QUALITY_1080P_QVBR || 8,
+          audioBitrate: COMPRESSION_SETTINGS?.AUDIO_BITRATE_1080P || 128000,
+          codecProfile: 'HIGH'
+        }));
+      }
+    }
+    if (outputs.length === 0) {
+      outputs.push(this.buildH264Output({
+        nameModifier: '_720p',
+        width: 1280,
+        height: 720,
+        maxBitrate: COMPRESSION_SETTINGS?.MAX_BITRATE_720P || 1400000,
+        qvbrLevel: COMPRESSION_SETTINGS?.QUALITY_720P_QVBR || 7,
+        audioBitrate: COMPRESSION_SETTINGS?.AUDIO_BITRATE_720P || 96000
+      }));
+    }
+    return outputs;
+  }
+
+  /**
+   * Generates MediaConvert job parameters for resolution-aware HLS output
+   */
+  buildJobSettings({ sourceBucket, sourceKey, outputPrefix, sourceHeight, sourceWidth, requestedOutputs }) {
     const baseDest = `s3://${this.outputBucket}/${outputPrefix}`;
     const destination = baseDest.endsWith('/') ? `${baseDest}master` : `${baseDest}/master`;
+    const renditions = this.resolveRenditions({ sourceHeight, sourceWidth, requestedOutputs });
 
     return {
       TimecodeConfig: { Source: 'ZEROBASED' },
@@ -59,152 +201,121 @@ class MediaConvertVideoService {
               OutputSelection: 'MANIFESTS_AND_SEGMENTS'
             }
           },
-          Outputs: [
-            // 720p HLS
-            {
-              ContainerSettings: {
-                Container: 'M3U8'
-              },
-              NameModifier: '_720p',
-              VideoDescription: {
-                Width: 1280,
-                Height: 720,
-                ScalingBehavior: 'DEFAULT',
-                CodecSettings: {
-                  Codec: 'H_264',
-                  H264Settings: {
-                    RateControlMode: 'QVBR',
-                    QvbrSettings: {
-                      QvbrQualityLevel: 7
-                    },
-                    QualityTuningLevel: COMPRESSION_SETTINGS?.QUALITY_TUNING_LEVEL || 'SINGLE_PASS',
-                    MaxBitrate: 1400000,
-                    CodecProfile: 'MAIN',
-                    CodecLevel: 'AUTO',
-                    InterlaceMode: 'PROGRESSIVE',
-                    GopSize: 60,
-                    GopSizeUnits: 'FRAMES',
-                    GopClosedCadence: 1,
-                    NumberBFramesBetweenReferenceFrames: 2,
-                    SceneChangeDetect: 'TRANSITION_DETECTION'
-                  }
-                }
-              },
-              AudioDescriptions: [
-                {
-                  CodecSettings: {
-                    Codec: 'AAC',
-                    AacSettings: {
-                      Bitrate: 96000,
-                      CodingMode: 'CODING_MODE_2_0',
-                      SampleRate: 48000
-                    }
-                  }
-                }
-              ]
-            },
-            // 1080p HLS
-            {
-              ContainerSettings: {
-                Container: 'M3U8'
-              },
-              NameModifier: '_1080p',
-              VideoDescription: {
-                Width: 1920,
-                Height: 1080,
-                ScalingBehavior: 'DEFAULT',
-                CodecSettings: {
-                  Codec: 'H_264',
-                  H264Settings: {
-                    RateControlMode: 'QVBR',
-                    QualityTuningLevel: COMPRESSION_SETTINGS?.QUALITY_TUNING_LEVEL || 'SINGLE_PASS',
-                    MaxBitrate: 2600000,
-                    QvbrQualityLevel: 8,
-                    CodecProfile: 'HIGH',
-                    CodecLevel: 'AUTO',
-                    InterlaceMode: 'PROGRESSIVE',
-                    GopSize: 60,
-                    GopSizeUnits: 'FRAMES',
-                    GopClosedCadence: 1,
-                    NumberBFramesBetweenReferenceFrames: 2,
-                    SceneChangeDetect: 'TRANSITION_DETECTION'
-                  }
-                }
-              },
-              AudioDescriptions: [
-                {
-                  CodecSettings: {
-                    Codec: 'AAC',
-                    AacSettings: {
-                      Bitrate: 128000,
-                      CodingMode: 'CODING_MODE_2_0',
-                      SampleRate: 48000
-                    }
-                  }
-                }
-              ]
-            }
-          ]
+          Outputs: this.buildOutputsForRenditions(renditions)
         }
       ]
     };
   }
 
+  async _sendCreateJob({ jobSettings, userMetadata = {} }) {
+    const acceleration = this.buildAccelerationSettings();
+    const params = {
+      Role: this.roleArn,
+      Settings: jobSettings,
+      UserMetadata: userMetadata
+    };
+    if (acceleration) {
+      params.AccelerationSettings = acceleration;
+    }
+
+    const command = new CreateJobCommand(params);
+    const response = await this.client.send(command);
+    return {
+      jobId: response.Job.Id,
+      status: response.Job.Status,
+      createdAt: response.Job.CreatedAt,
+      accelerationMode: acceleration ? acceleration.Mode : 'DISABLED',
+      pricingTierExpected: acceleration ? 'PROFESSIONAL' : 'BASIC'
+    };
+  }
+
   /**
-   * Submits an adaptive quality-preserving MediaConvert job (Progressive FastStart MP4)
+   * Submits an adaptive quality-preserving MediaConvert job (HLS ladder)
    */
-  async submitAdaptiveJob({ sourceBucket, sourceKey, outputPrefix, analysis, userMetadata = {} }) {
+  async submitAdaptiveJob({
+    sourceBucket,
+    sourceKey,
+    outputPrefix,
+    analysis,
+    userMetadata = {},
+    requestedOutputs,
+    sourceHeight,
+    sourceWidth
+  }) {
     const videoCompressor = require('./video.compressor');
+    const height = sourceHeight || analysis?.targetHeight || analysis?.height;
+    const width = sourceWidth || analysis?.targetWidth || analysis?.width;
+    const outs = requestedOutputs || (analysis?.targetResolution === '1080p'
+      ? ['720p', '1080p']
+      : analysis?.targetResolution === '480p'
+        ? ['480p']
+        : analysis?.targetResolution === '720p'
+          ? ['720p']
+          : undefined);
+
     const jobSettings = videoCompressor.buildMediaConvertJobSettings({
       sourceBucket,
       sourceKey,
       outputBucket: this.outputBucket,
       outputKeyPrefix: outputPrefix,
-      analysis: analysis || { targetResolution: '1080p' }
+      analysis: {
+        ...(analysis || {}),
+        targetResolution: analysis?.targetResolution || (
+          (outs || []).includes('1080p') ? '1080p' : (outs || []).includes('480p') ? '480p' : '720p'
+        ),
+        // Never enable deinterlace unless explicitly detected — advanced preprocessors are Professional
+        isInterlaced: Boolean(analysis?.isInterlaced),
+        scanType: analysis?.scanType
+      }
     });
 
-    const command = new CreateJobCommand({
-      Role: this.roleArn,
-      Settings: jobSettings,
-      AccelerationSettings: {
-        Mode: 'PREFERRED'
-      },
-      UserMetadata: userMetadata
-    });
+    // If compressor produced outputs, still allow explicit requestedOutputs override via rebuild
+    if (outs && outs.length > 0) {
+      const rebuilt = this.buildJobSettings({
+        sourceBucket,
+        sourceKey,
+        outputPrefix,
+        sourceHeight: height,
+        sourceWidth: width,
+        requestedOutputs: outs
+      });
+      return this._sendCreateJob({ jobSettings: rebuilt, userMetadata });
+    }
 
-    const response = await this.client.send(command);
-    return {
-      jobId: response.Job.Id,
-      status: response.Job.Status,
-      createdAt: response.Job.CreatedAt
-    };
+    return this._sendCreateJob({ jobSettings, userMetadata });
   }
 
   /**
-   * Submits a standard MediaConvert transcoding job
+   * Submits a standard MediaConvert transcoding job (Mode 2 direct topic)
    */
-  async submitTranscodeJob({ sourceBucket, sourceKey, outputPrefix, userMetadata = {} }) {
-    const jobSettings = this.buildJobSettings({ sourceBucket, sourceKey, outputPrefix });
-    const command = new CreateJobCommand({
-      Role: this.roleArn,
-      Settings: jobSettings,
-      AccelerationSettings: {
-        Mode: 'PREFERRED'
-      },
-      UserMetadata: userMetadata
+  async submitTranscodeJob({
+    sourceBucket,
+    sourceKey,
+    outputPrefix,
+    userMetadata = {},
+    sourceHeight,
+    sourceWidth,
+    requestedOutputs,
+    analysis
+  }) {
+    const outs = requestedOutputs || this.resolveRenditions({
+      sourceHeight: sourceHeight || analysis?.targetHeight,
+      sourceWidth: sourceWidth || analysis?.targetWidth,
+      requestedOutputs
     });
 
-    const response = await this.client.send(command);
-    return {
-      jobId: response.Job.Id,
-      status: response.Job.Status,
-      createdAt: response.Job.CreatedAt
-    };
+    const jobSettings = this.buildJobSettings({
+      sourceBucket,
+      sourceKey,
+      outputPrefix,
+      sourceHeight,
+      sourceWidth,
+      requestedOutputs: outs
+    });
+
+    return this._sendCreateJob({ jobSettings, userMetadata });
   }
 
-  /**
-   * Helper: Formats seconds to MediaConvert canonical timecode (HH:MM:SS:FF)
-   */
   secondsToTimecode(seconds, fps = 30) {
     const totalSec = Math.max(0, Number(seconds) || 0);
     const hrs = Math.floor(totalSec / 3600);
@@ -219,9 +330,6 @@ class MediaConvertVideoService {
     return `${pad(hrs)}:${pad(mins)}:${pad(secs)}:${pad(frames)}`;
   }
 
-  /**
-   * Helper: Parses timecode string or number to seconds
-   */
   timecodeToSeconds(tc, fps = 30) {
     if (typeof tc === 'number') return Math.max(0, tc);
     if (!tc || typeof tc !== 'string') return 0;
@@ -248,9 +356,19 @@ class MediaConvertVideoService {
   }
 
   /**
-   * Generates MediaConvert job parameters using InputClippings for Topic splitting
+   * Topic clipping settings — resolution-aware, never upscale, max 1080p
    */
-  buildTopicClippingJobSettings({ sourceBucket, sourceKey, outputPrefix, startTimecode, endTimecode, fps = 30, sourceHeight = 1080, sourceWidth = 1920 }) {
+  buildTopicClippingJobSettings({
+    sourceBucket,
+    sourceKey,
+    outputPrefix,
+    startTimecode,
+    endTimecode,
+    fps = 30,
+    sourceHeight,
+    sourceWidth,
+    requestedOutputs
+  }) {
     const baseDest = `s3://${this.outputBucket}/${outputPrefix}`.replace(/\/+$/, '');
     const destination = `${baseDest}/master`;
 
@@ -262,97 +380,7 @@ class MediaConvertVideoService {
       });
     }
 
-    // Source Resolution Awareness & Anti-Upscale Gate:
-    // CASE 1: Source is <= 720p (e.g. 1280x720) -> Generate 720p ONLY (NO 1080p upscale)
-    // CASE 2: Source is >= 1080p (e.g. 1920x1080 or 4K) -> Generate 720p + 1080p (Max 1080p, no 4K)
-    const effectiveHeight = Number(sourceHeight) || 1080;
-    const include1080p = effectiveHeight > 720;
-
-    const outputs = [
-      // 720p HLS Rendition (Always included as baseline)
-      {
-        ContainerSettings: { Container: 'M3U8' },
-        NameModifier: '_720p',
-        VideoDescription: {
-          Width: 1280,
-          Height: 720,
-          ScalingBehavior: 'DEFAULT',
-          CodecSettings: {
-            Codec: 'H_264',
-            H264Settings: {
-              RateControlMode: 'QVBR',
-              QvbrSettings: { QvbrQualityLevel: COMPRESSION_SETTINGS?.QUALITY_720P_QVBR || 7 },
-              QualityTuningLevel: COMPRESSION_SETTINGS?.QUALITY_TUNING_LEVEL || 'SINGLE_PASS',
-              MaxBitrate: COMPRESSION_SETTINGS?.MAX_BITRATE_720P || 1400000,
-              CodecProfile: 'MAIN',
-              CodecLevel: 'AUTO',
-              InterlaceMode: 'PROGRESSIVE',
-              FramerateControl: 'INITIALIZE_FROM_SOURCE',
-              GopSize: 60,
-              GopSizeUnits: 'FRAMES',
-              GopClosedCadence: 1,
-              NumberBFramesBetweenReferenceFrames: 2,
-              SceneChangeDetect: 'TRANSITION_DETECTION'
-            }
-          }
-        },
-        AudioDescriptions: [
-          {
-            CodecSettings: {
-              Codec: 'AAC',
-              AacSettings: {
-                Bitrate: COMPRESSION_SETTINGS?.AUDIO_BITRATE_720P || 96000,
-                CodingMode: 'CODING_MODE_2_0',
-                SampleRate: 48000
-              }
-            }
-          }
-        ]
-      }
-    ];
-
-    if (include1080p) {
-      outputs.push({
-        // 1080p HLS Rendition
-        ContainerSettings: { Container: 'M3U8' },
-        NameModifier: '_1080p',
-        VideoDescription: {
-          Width: 1920,
-          Height: 1080,
-          ScalingBehavior: 'DEFAULT',
-          CodecSettings: {
-            Codec: 'H_264',
-            H264Settings: {
-              RateControlMode: 'QVBR',
-              QualityTuningLevel: COMPRESSION_SETTINGS?.QUALITY_TUNING_LEVEL || 'SINGLE_PASS',
-              MaxBitrate: COMPRESSION_SETTINGS?.MAX_BITRATE_1080P || 2800000,
-              QvbrSettings: { QvbrQualityLevel: COMPRESSION_SETTINGS?.QUALITY_1080P_QVBR || 8 },
-              CodecProfile: 'HIGH',
-              CodecLevel: 'AUTO',
-              InterlaceMode: 'PROGRESSIVE',
-              FramerateControl: 'INITIALIZE_FROM_SOURCE',
-              GopSize: 60,
-              GopSizeUnits: 'FRAMES',
-              GopClosedCadence: 1,
-              NumberBFramesBetweenReferenceFrames: 2,
-              SceneChangeDetect: 'TRANSITION_DETECTION'
-            }
-          }
-        },
-        AudioDescriptions: [
-          {
-            CodecSettings: {
-              Codec: 'AAC',
-              AacSettings: {
-                Bitrate: COMPRESSION_SETTINGS?.AUDIO_BITRATE_1080P || 128000,
-                CodingMode: 'CODING_MODE_2_0',
-                SampleRate: 48000
-              }
-            }
-          }
-        ]
-      });
-    }
+    const renditions = this.resolveRenditions({ sourceHeight, sourceWidth, requestedOutputs });
 
     return {
       TimecodeConfig: { Source: 'ZEROBASED' },
@@ -384,15 +412,12 @@ class MediaConvertVideoService {
               OutputSelection: 'MANIFESTS_AND_SEGMENTS'
             }
           },
-          Outputs: outputs
+          Outputs: this.buildOutputsForRenditions(renditions)
         }
       ]
     };
   }
 
-  /**
-   * Submits a topic-level MediaConvert job with InputClippings
-   */
   async submitTopicClippingJob({
     sourceBucket,
     sourceKey,
@@ -402,8 +427,9 @@ class MediaConvertVideoService {
     startTimecode,
     endTimecode,
     fps = 30,
-    sourceHeight = 1080,
-    sourceWidth = 1920,
+    sourceHeight,
+    sourceWidth,
+    requestedOutputs,
     userMetadata = {}
   }) {
     const finalStartTc = startTimecode || this.secondsToTimecode(startTimeSeconds, fps);
@@ -417,43 +443,35 @@ class MediaConvertVideoService {
       endTimecode: finalEndTc,
       fps,
       sourceHeight,
-      sourceWidth
+      sourceWidth,
+      requestedOutputs
     });
 
-    const command = new CreateJobCommand({
-      Role: this.roleArn,
-      Settings: jobSettings,
-      AccelerationSettings: {
-        Mode: COMPRESSION_SETTINGS.ACCELERATION_MODE || 'PREFERRED'
-      },
-      UserMetadata: {
+    const result = await this._sendCreateJob({
+      jobSettings,
+      userMetadata: {
         ...userMetadata,
         startTimecode: String(finalStartTc),
         endTimecode: String(finalEndTc)
       }
     });
 
-    const response = await this.client.send(command);
     return {
-      jobId: response.Job.Id,
-      status: response.Job.Status,
+      ...result,
       startTimecode: finalStartTc,
       endTimecode: finalEndTc,
-      sourceHeight,
-      sourceWidth,
-      createdAt: response.Job.CreatedAt
+      sourceHeight: Number(sourceHeight) || null,
+      sourceWidth: Number(sourceWidth) || null,
+      requestedOutputs: this.resolveRenditions({ sourceHeight, sourceWidth, requestedOutputs })
     };
   }
 
-  /**
-   * Fetches the current job status directly from MediaConvert API
-   */
   async getJobStatus(jobId) {
     try {
       const command = new GetJobCommand({ Id: jobId });
       const response = await this.client.send(command);
       return {
-        status: response.Job.Status, // 'SUBMITTED' | 'PROGRESSING' | 'COMPLETE' | 'CANCELED' | 'ERROR'
+        status: response.Job.Status,
         jobPercentComplete: response.Job.JobPercentComplete ?? (response.Job.Status === 'COMPLETE' ? 100 : 0),
         currentPhase: response.Job.CurrentPhase || 'TRANSCODING',
         errorMessage: response.Job.ErrorMessage || null
@@ -468,17 +486,12 @@ class MediaConvertVideoService {
     }
   }
 
-  /**
-   * Cancels an active MediaConvert job (SUBMITTED or PROGRESSING)
-   * Safely handles race conditions if the job is already COMPLETE, ERROR, or CANCELED
-   */
   async cancelJob(jobId) {
     if (!jobId) {
       return { canceled: false, reason: 'NO_JOB_ID' };
     }
 
     try {
-      // 1. Check current job status
       const jobStatus = await this.getJobStatus(jobId);
       if (['COMPLETE', 'ERROR', 'CANCELED'].includes(jobStatus.status)) {
         console.log(`ℹ️ [AWS MediaConvert] Job ${jobId} is already in terminal state '${jobStatus.status}'. Cancellation skipped.`);
@@ -489,7 +502,6 @@ class MediaConvertVideoService {
         };
       }
 
-      // 2. Invoke CancelJobCommand
       const command = new CancelJobCommand({ Id: jobId });
       await this.client.send(command);
       console.log(`🛑 [AWS MediaConvert] Successfully cancelled job ${jobId}`);
@@ -499,7 +511,6 @@ class MediaConvertVideoService {
         previousStatus: jobStatus.status
       };
     } catch (err) {
-      // Handle race condition where job finished/errored right as cancel command arrived
       const msg = err.message || '';
       if (msg.includes('Job is in COMPLETE state') || msg.includes('Job is in ERROR state') || msg.includes('Job is in CANCELED state')) {
         console.log(`ℹ️ [AWS MediaConvert] Job ${jobId} reached terminal state during cancel request: ${msg}`);
@@ -513,4 +524,3 @@ class MediaConvertVideoService {
 }
 
 module.exports = new MediaConvertVideoService();
-
