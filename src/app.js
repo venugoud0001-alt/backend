@@ -84,7 +84,8 @@ const corsAllowedHeaders = [
   'Cache-Control',
   'Pragma',
   'Expires',
-  'x-webhook-secret'
+  'x-webhook-secret',
+  'ngrok-skip-browser-warning'
 ];
 
 const corsOptions = {
