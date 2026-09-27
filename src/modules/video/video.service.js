@@ -3277,6 +3277,30 @@ class VideoService {
                 topic.processing_status = 'FAILED';
                 topic.processing_error = jobStatus.errorMessage;
                 topic.jobPercentComplete = 0;
+              } else if (jobStatus.status === 'UNKNOWN') {
+                // AWS job no longer found (expired/deleted) but DB still shows PROCESSING.
+                // Treat as a missed webhook: self-heal by marking FAILED so it can be re-queued.
+                console.warn(`[getModuleTopics] Job ${topic.mediaconvert_job_id} for topic ${topic.id} is UNKNOWN (possibly expired). Self-healing to FAILED.`);
+                hasTerminalChange = true;
+                await this.handleTopicProcessingFailed({
+                  jobId: topic.mediaconvert_job_id,
+                  topicId: topic.id,
+                  sourceVideoId: topic.source_video_id || sourceRecord?.id,
+                  moduleId: topic.module_id || moduleId,
+                  courseId: topic.course_id || sourceRecord?.course_id,
+                  errorDetails: { message: 'MediaConvert job not found (possible missed webhook). Please re-queue.' }
+                });
+                topic.processing_status = 'FAILED';
+                topic.jobPercentComplete = 0;
+              } else {
+                // Still actively encoding — persist progress to DB so it survives server restarts
+                const livePercent = topic.jobPercentComplete;
+                if (typeof livePercent === 'number' && livePercent > 0) {
+                  supabase.from('topics').update({
+                    job_percent_complete: livePercent,
+                    updated_at: new Date().toISOString()
+                  }).eq('id', topic.id).then(() => {}).catch(() => {});
+                }
               }
             }
           } catch (pollErr) {
@@ -3313,11 +3337,20 @@ class VideoService {
         if (t.processing_status === 'READY') {
           totalProgressSum += 100;
         } else if (t.processing_status === 'PROCESSING') {
-          const pct = typeof t.jobPercentComplete === 'number' && t.jobPercentComplete > 0 ? t.jobPercentComplete : 20;
+          // Prefer live in-memory value, fall back to DB-persisted value, then default to 20
+          const pct = (typeof t.jobPercentComplete === 'number' && t.jobPercentComplete > 0)
+            ? t.jobPercentComplete
+            : (typeof t.job_percent_complete === 'number' && t.job_percent_complete > 0)
+              ? t.job_percent_complete
+              : 20;
           totalProgressSum += pct;
+        } else if (t.processing_status === 'QUEUED') {
+          // Queued topics get a small 5% contribution so they don't crush the average to near 0
+          totalProgressSum += 5;
         }
       }
     }
+
     const progressPercent = topicsList.length > 0 ? Math.min(100, Math.round(totalProgressSum / topicsList.length)) : 0;
 
     // Generate presigned source preview URL if source exists in S3
