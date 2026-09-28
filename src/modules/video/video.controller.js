@@ -282,6 +282,10 @@ class VideoController {
         return errorResponse(res, 'lessonId parameter is required.', 400);
       }
 
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.set('Pragma', 'no-cache');
+      res.set('Expires', '0');
+
       const status = await videoService.getVideoStatus(lessonId, courseId);
       return successResponse(res, status, 200);
     } catch (err) {
@@ -702,8 +706,13 @@ class VideoController {
    */
   async getTopicStatus(req, res, next) {
     try {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.set('Pragma', 'no-cache');
+      res.set('Expires', '0');
+
       const { topicId } = req.params;
-      const topic = await videoService.getVideoRecord(`topic_${topicId}`) || await videoService.getVideoRecord(topicId);
+      const courseId = req.query.courseId || req.query.course_id;
+      const topic = await videoService.getTopicStatus(topicId, courseId);
       if (!topic) {
         return errorResponse(res, 'Topic record not found.', 404);
       }

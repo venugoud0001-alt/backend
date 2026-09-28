@@ -1021,7 +1021,63 @@ class VideoService {
         const hasMcJob = Boolean(r.mediaconvert_job_id || r.job_id);
 
         let segmentInfo = { segmentCount: 0, manifestCount: 0, totalFiles: 0 };
-        if (r.status === VIDEO_STATUS.PROCESSING) {
+        let liveJobPercent = null;
+        if (r.status === VIDEO_STATUS.PROCESSING && hasMcJob) {
+          try {
+            const mcStatus = await mediaConvertVideoService.getJobStatus(r.mediaconvert_job_id || r.job_id);
+            if (mcStatus?.status === 'COMPLETE') {
+              const isTopicJob = Boolean(
+                r.is_individual_topic_video ||
+                r.topic_id ||
+                (r.lesson_id && r.module_id && String(r.lesson_id) !== String(r.module_id))
+              );
+              if (isTopicJob) {
+                await this.handleTopicProcessingCompleted({
+                  jobId: r.mediaconvert_job_id || r.job_id,
+                  topicId: r.topic_id || r.lesson_id,
+                  sourceVideoId: r.id,
+                  moduleId: r.module_id,
+                  courseId: r.course_id,
+                  isIndividualTopicVideo: true
+                });
+              } else {
+                await this.handleProcessingCompleted({
+                  jobId: r.mediaconvert_job_id || r.job_id,
+                  videoAssetId: r.id
+                });
+              }
+              r.status = VIDEO_STATUS.READY;
+              liveJobPercent = 100;
+            } else if (mcStatus?.status === 'ERROR') {
+              const isTopicJob = Boolean(
+                r.is_individual_topic_video ||
+                r.topic_id ||
+                (r.lesson_id && r.module_id && String(r.lesson_id) !== String(r.module_id))
+              );
+              if (isTopicJob) {
+                await this.handleTopicProcessingFailed({
+                  jobId: r.mediaconvert_job_id || r.job_id,
+                  topicId: r.topic_id || r.lesson_id,
+                  sourceVideoId: r.id,
+                  moduleId: r.module_id,
+                  courseId: r.course_id,
+                  errorDetails: { message: mcStatus.errorMessage || 'MediaConvert failed' }
+                });
+              } else {
+                await this.handleProcessingFailed({
+                  jobId: r.mediaconvert_job_id || r.job_id,
+                  videoAssetId: r.id,
+                  errorDetails: { message: mcStatus.errorMessage || 'MediaConvert failed' }
+                });
+              }
+              r.status = VIDEO_STATUS.FAILED;
+            } else if (typeof mcStatus?.jobPercentComplete === 'number') {
+              liveJobPercent = mcStatus.jobPercentComplete;
+            }
+          } catch (mcErr) {}
+        }
+
+        if (r.status === VIDEO_STATUS.PROCESSING || r.status === VIDEO_STATUS.READY) {
           const effectivePrefix = r.hls_prefix || 
             (r.course_slug && r.module_slug ? s3PathUtils.buildS3HlsPrefix(r.course_slug, r.module_slug) : null) ||
             `courses/${r.course_id}/modules/${r.module_id}/lessons/${r.lesson_id}/`;
@@ -1149,7 +1205,7 @@ class VideoService {
           rawStatus: r.status,
           isTopicMode: !isIndividualTopic && !!(topicsSummary && topicsSummary.totalTopics > 0),
           topicsSummary,
-          jobPercentComplete: topicsSummary?.progressPercent ?? (effectiveStatus === 'READY' ? 100 : effectiveStatus === 'PROCESSING' ? 50 : 0),
+          jobPercentComplete: liveJobPercent ?? topicsSummary?.progressPercent ?? (effectiveStatus === 'READY' ? 100 : effectiveStatus === 'PROCESSING' ? 50 : 0),
           hlsMasterUrl: r.hls_master_url,
           segmentsGenerated: segmentInfo.segmentCount || 0,
           manifestsGenerated: segmentInfo.manifestCount || 0,
@@ -2156,53 +2212,55 @@ class VideoService {
 
     // If currently PROCESSING and has a jobId, check status update
     if (record.status === VIDEO_STATUS.PROCESSING && record.mediaconvert_job_id) {
-      const jobStatus = await mediaConvertVideoService.getJobStatus(record.mediaconvert_job_id);
-      currentJobPercent = jobStatus.jobPercentComplete || 0;
-      currentPhase = jobStatus.currentPhase || 'OPTIMIZING';
+      const jobStatus = await mediaConvertVideoService.getJobStatus(record.mediaconvert_job_id).catch(() => null);
+      if (jobStatus) {
+        currentJobPercent = jobStatus.jobPercentComplete || 0;
+        currentPhase = jobStatus.currentPhase || 'OPTIMIZING';
 
-      if (jobStatus.status === 'COMPLETE') {
-        const isTopicJob = Boolean(
-          record.is_individual_topic_video ||
-          record.topic_id ||
-          (record.lesson_id && record.module_id && String(record.lesson_id) !== String(record.module_id))
-        );
-        if (isTopicJob) {
-          await this.handleTopicProcessingCompleted({
-            jobId: record.mediaconvert_job_id,
-            topicId: record.topic_id || record.lesson_id,
-            sourceVideoId: record.id,
-            moduleId: record.module_id,
-            courseId: record.course_id,
-            isIndividualTopicVideo: true
-          });
-        } else {
-          await this.handleProcessingCompleted({ jobId: record.mediaconvert_job_id, videoAssetId: record.id });
+        if (jobStatus.status === 'COMPLETE') {
+          const isTopicJob = Boolean(
+            record.is_individual_topic_video ||
+            record.topic_id ||
+            (record.lesson_id && record.module_id && String(record.lesson_id) !== String(record.module_id))
+          );
+          if (isTopicJob) {
+            await this.handleTopicProcessingCompleted({
+              jobId: record.mediaconvert_job_id,
+              topicId: record.topic_id || record.lesson_id,
+              sourceVideoId: record.id,
+              moduleId: record.module_id,
+              courseId: record.course_id,
+              isIndividualTopicVideo: true
+            });
+          } else {
+            await this.handleProcessingCompleted({ jobId: record.mediaconvert_job_id, videoAssetId: record.id });
+          }
+          record.status = VIDEO_STATUS.READY;
+          currentJobPercent = 100;
+        } else if (jobStatus.status === 'ERROR') {
+          const isTopicJob = Boolean(
+            record.is_individual_topic_video ||
+            record.topic_id ||
+            (record.lesson_id && record.module_id && String(record.lesson_id) !== String(record.module_id))
+          );
+          if (isTopicJob) {
+            await this.handleTopicProcessingFailed({
+              jobId: record.mediaconvert_job_id,
+              topicId: record.topic_id || record.lesson_id,
+              sourceVideoId: record.id,
+              moduleId: record.module_id,
+              courseId: record.course_id,
+              errorDetails: { message: jobStatus.errorMessage }
+            });
+          } else {
+            await this.handleProcessingFailed({
+              jobId: record.mediaconvert_job_id,
+              videoAssetId: record.id,
+              errorDetails: { message: jobStatus.errorMessage }
+            });
+          }
+          record.status = VIDEO_STATUS.FAILED;
         }
-        record.status = VIDEO_STATUS.READY;
-        currentJobPercent = 100;
-      } else if (jobStatus.status === 'ERROR') {
-        const isTopicJob = Boolean(
-          record.is_individual_topic_video ||
-          record.topic_id ||
-          (record.lesson_id && record.module_id && String(record.lesson_id) !== String(record.module_id))
-        );
-        if (isTopicJob) {
-          await this.handleTopicProcessingFailed({
-            jobId: record.mediaconvert_job_id,
-            topicId: record.topic_id || record.lesson_id,
-            sourceVideoId: record.id,
-            moduleId: record.module_id,
-            courseId: record.course_id,
-            errorDetails: { message: jobStatus.errorMessage }
-          });
-        } else {
-          await this.handleProcessingFailed({
-            jobId: record.mediaconvert_job_id,
-            videoAssetId: record.id,
-            errorDetails: { message: jobStatus.errorMessage }
-          });
-        }
-        record.status = VIDEO_STATUS.FAILED;
       }
     }
 
@@ -2386,6 +2444,105 @@ class VideoService {
       size1080pMB: segmentInfo.size1080pMB,
       totalHlsMB: segmentInfo.totalHlsMB,
       updatedAt: record.updated_at
+    };
+  }
+
+  /**
+   * 5B. Get Dedicated Topic Video Status & Telemetry
+   * Automatically polls AWS MediaConvert for active topic jobs, self-heals COMPLETE/ERROR,
+   * counts S3 segments, and keeps topics table, lesson_videos table, and UI in sync.
+   */
+  async getTopicStatus(topicId, courseId = null) {
+    if (!topicId) return null;
+    const cleanId = String(topicId).trim();
+
+    // 1. First attempt authoritative video record lookup via getVideoRecord / getVideoStatus
+    const statusRes = await this.getVideoStatus(cleanId, courseId).catch(() => null);
+    if (statusRes && statusRes.status && statusRes.status !== 'NO_VIDEO' && statusRes.status !== 'DELETED') {
+      return statusRes;
+    }
+
+    // 2. Fall back to checking Supabase topics table directly (Mode 1 clipping or standalone topic rows)
+    let dbTopic = null;
+    try {
+      const { data } = await supabase.from('topics').select('*').eq('id', cleanId).maybeSingle();
+      dbTopic = data;
+    } catch (e) {}
+
+    if (!dbTopic) {
+      const mem = memoryVideoStore.get(`topic_${cleanId}`) || memoryVideoStore.get(cleanId);
+      if (mem) dbTopic = mem;
+    }
+
+    if (!dbTopic) return null;
+
+    // 3. If currently in PROCESSING state with a MediaConvert job, query AWS directly
+    let currentJobPercent = dbTopic.job_percent_complete || 0;
+    if (dbTopic.processing_status === 'PROCESSING' && dbTopic.mediaconvert_job_id) {
+      try {
+        const jobStatus = await mediaConvertVideoService.getJobStatus(dbTopic.mediaconvert_job_id);
+        if (jobStatus) {
+          currentJobPercent = jobStatus.jobPercentComplete || 0;
+          if (jobStatus.status === 'COMPLETE') {
+            await this.handleTopicProcessingCompleted({
+              jobId: dbTopic.mediaconvert_job_id,
+              topicId: dbTopic.id,
+              sourceVideoId: dbTopic.source_video_id || dbTopic.video_asset_id,
+              moduleId: dbTopic.module_id,
+              courseId: dbTopic.course_id || courseId,
+              isIndividualTopicVideo: true
+            });
+            dbTopic.processing_status = 'READY';
+            currentJobPercent = 100;
+          } else if (jobStatus.status === 'ERROR') {
+            await this.handleTopicProcessingFailed({
+              jobId: dbTopic.mediaconvert_job_id,
+              topicId: dbTopic.id,
+              sourceVideoId: dbTopic.source_video_id || dbTopic.video_asset_id,
+              moduleId: dbTopic.module_id,
+              courseId: dbTopic.course_id || courseId,
+              errorDetails: { message: jobStatus.errorMessage || 'MediaConvert transcode error' }
+            });
+            dbTopic.processing_status = 'FAILED';
+          } else if (typeof currentJobPercent === 'number' && currentJobPercent > 0) {
+            supabase.from('topics').update({
+              job_percent_complete: currentJobPercent,
+              updated_at: new Date().toISOString()
+            }).eq('id', dbTopic.id).catch(() => {});
+          }
+        }
+      } catch (mcErr) {
+        console.warn(`[getTopicStatus] Polling AWS MediaConvert job ${dbTopic.mediaconvert_job_id} failed:`, mcErr.message);
+      }
+    }
+
+    // 4. Count S3 HLS segments if prefix exists
+    let segmentInfo = { segmentCount: 0, manifestCount: 0, totalFiles: 0 };
+    if (dbTopic.hls_prefix) {
+      try {
+        segmentInfo = await s3VideoService.countHlsSegments({ prefix: dbTopic.hls_prefix });
+      } catch (e) {}
+    }
+
+    return {
+      id: dbTopic.id,
+      topicId: dbTopic.id,
+      lessonId: dbTopic.id,
+      videoAssetId: dbTopic.video_asset_id || dbTopic.source_video_id || dbTopic.id,
+      moduleId: dbTopic.module_id,
+      courseId: dbTopic.course_id,
+      status: dbTopic.processing_status || 'PROCESSING',
+      processingStatus: dbTopic.processing_status || 'PROCESSING',
+      hlsMasterUrl: dbTopic.hls_master_url,
+      hls720pUrl: dbTopic.hls_720p_url,
+      hls1080pUrl: dbTopic.hls_1080p_url,
+      durationSeconds: dbTopic.duration_seconds || 0,
+      jobPercentComplete: currentJobPercent,
+      segmentsGenerated: segmentInfo.segmentCount || 0,
+      manifestsGenerated: segmentInfo.manifestCount || 0,
+      totalHlsFiles: segmentInfo.totalFiles || 0,
+      errorMessage: dbTopic.processing_error || null,
+      updatedAt: dbTopic.updated_at
     };
   }
 
