@@ -482,17 +482,9 @@ class VideoCleanupService {
       const { data: records } = await q;
       if (Array.isArray(records) && records.length > 0) {
         for (const rec of records) {
-          await supabase
-            .from('lesson_videos')
-            .update({
-              status: 'UNASSIGNED',
-              cleanup_status: 'PENDING_DELETE',
-              cleanup_after: cleanupAfter,
-              cleanup_reason: 'REMOVED_FROM_TOPIC',
-              hls_master_url: null,
-              updated_at: new Date().toISOString()
-            })
-            .eq('id', rec.id);
+          try {
+            await supabase.from('lesson_videos').delete().eq('id', rec.id);
+          } catch (delRecErr) {}
 
           this.logCleanupAudit({
             video_id: rec.id,
@@ -501,7 +493,7 @@ class VideoCleanupService {
             object_key: rec.source_s3_key,
             object_type: 'TOPIC_VIDEO',
             cleanup_reason: 'REMOVED_FROM_TOPIC',
-            cleanup_status: 'PENDING_DELETE_48H',
+            cleanup_status: 'REMOVED',
             bytes_reclaimed: 0
           });
         }
@@ -519,6 +511,7 @@ class VideoCleanupService {
             hls_720p_url: null,
             hls_1080p_url: null,
             hls_prefix: null,
+            processing_error: null,
             updated_at: new Date().toISOString()
           })
           .eq('id', topicId);
@@ -526,11 +519,15 @@ class VideoCleanupService {
         console.warn('⚠️ [Video Cleanup] Notice resetting topic in database during unassign:', tDbErr.message);
       }
 
-      // Clear memory video store for this topic
-      if (videoService?.memoryVideoStore) {
-        videoService.memoryVideoStore.delete(`topic_${topicId}`);
-        if (videoAssetId) videoService.memoryVideoStore.delete(String(videoAssetId));
-        if (topic?.source_video_id) videoService.memoryVideoStore.delete(String(topic.source_video_id));
+      // Clear memory video store for this topic & active jobs cache
+      if (videoService) {
+        videoService._activeJobsCache = null;
+        if (videoService.memoryVideoStore) {
+          videoService.memoryVideoStore.delete(`topic_${topicId}`);
+          videoService.memoryVideoStore.delete(String(topicId));
+          if (videoAssetId) videoService.memoryVideoStore.delete(String(videoAssetId));
+          if (topic?.source_video_id) videoService.memoryVideoStore.delete(String(topic.source_video_id));
+        }
       }
 
       // Unlink topic video in courses.curriculum_modules JSON
@@ -743,20 +740,20 @@ class VideoCleanupService {
       }
     }
 
-    // 6. Delete or mark PURGED in lesson_videos
-    if (record?.id) {
-      try {
-        await supabase
-          .from('lesson_videos')
-          .update({
-            status: 'PURGED',
-            cleanup_status: 'COMPLETED',
-            hls_master_url: null,
-            source_s3_key: null,
-            updated_at: new Date().toISOString()
-          })
-          .eq('id', record.id);
-      } catch (e) {}
+    // 6. Delete all matching records from lesson_videos table
+    try {
+      let lvDel = supabase.from('lesson_videos').delete();
+      if (effectiveCourseId) {
+        const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(effectiveCourseId));
+        if (isUUID) lvDel = lvDel.eq('course_id', effectiveCourseId);
+      }
+      const delFilters = [`lesson_id.eq.${topicId}`, `topic_id.eq.${topicId}`];
+      if (videoAssetId) delFilters.push(`id.eq.${videoAssetId}`);
+      if (record?.id) delFilters.push(`id.eq.${record.id}`);
+      if (topic?.source_video_id) delFilters.push(`id.eq.${topic.source_video_id}`);
+      await lvDel.or(delFilters.join(','));
+    } catch (e) {
+      console.warn('⚠️ [Video Cleanup] lesson_videos delete notice:', e.message);
     }
 
     // 7. Reset topic row in topics table
@@ -777,11 +774,16 @@ class VideoCleanupService {
         .eq('id', topicId);
     } catch (e) {}
 
-    // 8. Clear memory video store
-    if (videoService?.memoryVideoStore) {
-      videoService.memoryVideoStore.delete(`topic_${topicId}`);
-      if (record?.id) videoService.memoryVideoStore.delete(String(record.id));
-      if (videoAssetId) videoService.memoryVideoStore.delete(String(videoAssetId));
+    // 8. Clear memory video store & active jobs cache
+    if (videoService) {
+      videoService._activeJobsCache = null;
+      if (videoService.memoryVideoStore) {
+        videoService.memoryVideoStore.delete(`topic_${topicId}`);
+        videoService.memoryVideoStore.delete(String(topicId));
+        if (record?.id) videoService.memoryVideoStore.delete(String(record.id));
+        if (videoAssetId) videoService.memoryVideoStore.delete(String(videoAssetId));
+        if (topic?.source_video_id) videoService.memoryVideoStore.delete(String(topic.source_video_id));
+      }
     }
 
     // 9. Update courses.curriculum_modules JSON

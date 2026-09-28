@@ -1024,13 +1024,35 @@ class VideoService {
         let liveJobPercent = null;
         if (r.status === VIDEO_STATUS.PROCESSING && hasMcJob) {
           try {
+            const isTopicJob = Boolean(
+              r.is_individual_topic_video ||
+              r.topic_id ||
+              (r.lesson_id && r.module_id && String(r.lesson_id) !== String(r.module_id))
+            );
+
+            if (isTopicJob) {
+              const targetTopicId = r.topic_id || r.lesson_id;
+              let liveTopic = null;
+              try {
+                const { data } = await supabase.from('topics').select('id, processing_status, mediaconvert_job_id').eq('id', targetTopicId).maybeSingle();
+                liveTopic = data;
+              } catch (e) {}
+
+              // If topic was deleted, unassigned, cancelled, or doesn't exist, purge orphan row and skip
+              if (!liveTopic || ['DRAFT', 'DELETED', 'DELETING', 'CANCELED', 'CANCELLING', 'PURGED'].includes(liveTopic.processing_status) || (liveTopic.mediaconvert_job_id && String(liveTopic.mediaconvert_job_id) !== String(r.mediaconvert_job_id || r.job_id))) {
+                console.log(`🧹 [listActiveTranscodingJobs] Cleaning orphan topic video job ${r.id} for topic ${targetTopicId}`);
+                try {
+                  await supabase.from('lesson_videos').delete().eq('id', r.id);
+                  if (memoryVideoStore) {
+                    memoryVideoStore.delete(String(r.id));
+                  }
+                } catch (delErr) {}
+                return null;
+              }
+            }
+
             const mcStatus = await mediaConvertVideoService.getJobStatus(r.mediaconvert_job_id || r.job_id);
             if (mcStatus?.status === 'COMPLETE') {
-              const isTopicJob = Boolean(
-                r.is_individual_topic_video ||
-                r.topic_id ||
-                (r.lesson_id && r.module_id && String(r.lesson_id) !== String(r.module_id))
-              );
               if (isTopicJob) {
                 await this.handleTopicProcessingCompleted({
                   jobId: r.mediaconvert_job_id || r.job_id,
@@ -1370,7 +1392,30 @@ class VideoService {
       console.warn('⚠️ [Video Pipeline Cancel] DB delete notice:', dbErr.message);
     }
 
-    // 8. Clear Memory Store
+    // 8. Reset Topic Row in topics table if this was a topic video
+    try {
+      const topicIdentifier = record?.topic_id || (record?.is_individual_topic_video ? record?.lesson_id : null) || targetLessonId;
+      if (topicIdentifier) {
+        await supabase
+          .from('topics')
+          .update({
+            processing_status: 'DRAFT',
+            mediaconvert_job_id: null,
+            source_video_id: null,
+            hls_master_url: null,
+            hls_720p_url: null,
+            hls_1080p_url: null,
+            hls_prefix: null,
+            processing_error: null,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', topicIdentifier);
+        memoryVideoStore.delete(`topic_${topicIdentifier}`);
+      }
+    } catch (tErr) {}
+
+    // 9. Clear Memory Store and Invalidate Active Jobs Cache
+    this._activeJobsCache = null;
     memoryVideoStore.delete(String(identifier));
     if (record?.id) memoryVideoStore.delete(String(record.id));
     if (record?.lesson_id) memoryVideoStore.delete(String(record.lesson_id));
@@ -2198,7 +2243,7 @@ class VideoService {
    */
   async getVideoStatus(lessonId, courseId = null) {
     const record = await this.getVideoRecord(lessonId, courseId);
-    if (!record || record.status === 'DELETED' || record.status === 'NO_VIDEO' || record.status === 'UNPROCESSED') {
+    if (!record || ['DELETED', 'NO_VIDEO', 'UNPROCESSED', 'PURGED', 'UNASSIGNED', 'DELETING', 'CANCELED', 'CANCELLING'].includes(record.status)) {
       return {
         lessonId,
         status: record?.status || 'NO_VIDEO',
@@ -2224,9 +2269,23 @@ class VideoService {
             (record.lesson_id && record.module_id && String(record.lesson_id) !== String(record.module_id))
           );
           if (isTopicJob) {
+            const targetTopicId = record.topic_id || record.lesson_id;
+            let dbTop = null;
+            try {
+              const { data } = await supabase.from('topics').select('id, processing_status, mediaconvert_job_id').eq('id', targetTopicId).maybeSingle();
+              dbTop = data;
+            } catch (e) {}
+            if (!dbTop || ['DRAFT', 'DELETED', 'DELETING', 'CANCELED', 'CANCELLING', 'PURGED'].includes(dbTop.processing_status)) {
+              return {
+                lessonId,
+                status: 'NO_VIDEO',
+                hlsMasterUrl: null,
+                topicsSummary: null
+              };
+            }
             await this.handleTopicProcessingCompleted({
               jobId: record.mediaconvert_job_id,
-              topicId: record.topic_id || record.lesson_id,
+              topicId: targetTopicId,
               sourceVideoId: record.id,
               moduleId: record.module_id,
               courseId: record.course_id,
@@ -2476,6 +2535,21 @@ class VideoService {
 
     if (!dbTopic) return null;
 
+    if (['DRAFT', 'DELETED', 'PURGED', 'UNASSIGNED'].includes(dbTopic.processing_status) && !dbTopic.hls_master_url) {
+      return {
+        id: dbTopic.id,
+        topicId: dbTopic.id,
+        lessonId: dbTopic.id,
+        videoAssetId: null,
+        moduleId: dbTopic.module_id,
+        courseId: dbTopic.course_id,
+        status: 'NO_VIDEO',
+        processingStatus: dbTopic.processing_status || 'DRAFT',
+        hlsMasterUrl: null,
+        durationSeconds: 0
+      };
+    }
+
     // 3. If currently in PROCESSING state with a MediaConvert job, query AWS directly
     let currentJobPercent = dbTopic.job_percent_complete || 0;
     if (dbTopic.processing_status === 'PROCESSING' && dbTopic.mediaconvert_job_id) {
@@ -2484,6 +2558,19 @@ class VideoService {
         if (jobStatus) {
           currentJobPercent = jobStatus.jobPercentComplete || 0;
           if (jobStatus.status === 'COMPLETE') {
+            // Re-verify that topic was not deleted or unassigned in the database
+            const { data: latestTopic } = await supabase.from('topics').select('processing_status, mediaconvert_job_id').eq('id', dbTopic.id).maybeSingle().catch(() => ({ data: null }));
+            if (!latestTopic || ['DRAFT', 'DELETED', 'DELETING', 'CANCELED', 'CANCELLING', 'PURGED'].includes(latestTopic.processing_status)) {
+              return {
+                id: dbTopic.id,
+                topicId: dbTopic.id,
+                lessonId: dbTopic.id,
+                status: 'NO_VIDEO',
+                processingStatus: latestTopic?.processing_status || 'DRAFT',
+                hlsMasterUrl: null,
+                durationSeconds: 0
+              };
+            }
             await this.handleTopicProcessingCompleted({
               jobId: dbTopic.mediaconvert_job_id,
               topicId: dbTopic.id,
@@ -3976,18 +4063,43 @@ class VideoService {
   async handleTopicProcessingCompleted({ jobId, topicId, sourceVideoId, moduleId, courseId, jobSubmittedTime, jobStartedTime, jobFinishedTime, isIndividualTopicVideo = false }) {
     console.log(`✅ [TOPIC_JOB_COMPLETED] Topic ${topicId} (JobId: ${jobId}, ModuleId: ${moduleId}, Status: READY, Individual: ${isIndividualTopicVideo}) completed successfully.`);
 
-    let earlyTopic = memoryVideoStore.get(`topic_${topicId}`);
-    if (!earlyTopic) {
+    let dbTopic = null;
+    try {
+      const { data: dt } = await supabase.from('topics').select('*').eq('id', topicId).maybeSingle();
+      dbTopic = dt;
+    } catch (e) {}
+
+    let earlyTopic = memoryVideoStore.get(`topic_${topicId}`) || dbTopic;
+
+    // Safety Lock: Check if topic doesn't exist, was deleted, or video was purged/unassigned/draft
+    if (!dbTopic || ['DRAFT', 'DELETED', 'DELETING', 'CANCELED', 'CANCELLING', 'PURGED'].includes(dbTopic.processing_status)) {
+      console.log(`🔒 [Topic Pipeline Race Lock] Ignoring completion callback for deleted/unassigned topic (${topicId}) with status: ${dbTopic?.processing_status || 'NOT_FOUND'}`);
+      memoryVideoStore.delete(`topic_${topicId}`);
       try {
-        const { data } = await supabase.from('topics').select('processing_status, mediaconvert_job_id, processing_identity, hls_master_url').eq('id', topicId).maybeSingle();
-        earlyTopic = data;
+        if (sourceVideoId) {
+          await supabase.from('lesson_videos').delete().eq('id', sourceVideoId);
+        } else if (jobId) {
+          await supabase.from('lesson_videos').delete().eq('mediaconvert_job_id', jobId);
+        }
       } catch (e) {}
+      return;
     }
+
+    // Job ID validation - ignore stale/mismatched completion callbacks or if job was already cleared
+    if (jobId && dbTopic.mediaconvert_job_id && String(jobId) !== String(dbTopic.mediaconvert_job_id)) {
+      console.warn(`⚠️ [Topic Pipeline] Ignoring mismatched completion jobId ${jobId} for topic ${topicId} (db has ${dbTopic.mediaconvert_job_id})`);
+      return;
+    }
+    if (jobId && !dbTopic.mediaconvert_job_id && dbTopic.processing_status !== 'PROCESSING') {
+      console.warn(`⚠️ [Topic Pipeline] Ignoring completion jobId ${jobId} for topic ${topicId} as mediaconvert_job_id was already cleared`);
+      return;
+    }
+
     // Only short-circuit when topic is already playable (READY + HLS). A READY row without HLS
     // (or DRAFT after a re-upload race) must still run the full sync path.
-    if (earlyTopic?.processing_status === 'READY' && earlyTopic?.hls_master_url) {
+    if (dbTopic.processing_status === 'READY' && dbTopic.hls_master_url) {
       console.log(`ℹ️ [Topic Pipeline] Topic ${topicId} already READY with HLS. Ensuring lesson_videos + curriculum sync.`);
-      await mediaConvertJobGuard.markClaimReady({ mediaconvertJobId: jobId, processingIdentity: earlyTopic.processing_identity });
+      await mediaConvertJobGuard.markClaimReady({ mediaconvertJobId: jobId, processingIdentity: dbTopic.processing_identity || earlyTopic?.processing_identity });
       try {
         const topicReadySync = require('./video.topic-ready-sync.service');
         await topicReadySync.syncTopicReadyFromLessonVideos(topicId, {
@@ -3997,10 +4109,6 @@ class VideoService {
           force: false
         });
       } catch (_) {}
-      return;
-    }
-    if (jobId && earlyTopic?.mediaconvert_job_id && String(jobId) !== String(earlyTopic.mediaconvert_job_id)) {
-      console.warn(`⚠️ [Topic Pipeline] Ignoring mismatched completion jobId ${jobId} for topic ${topicId}`);
       return;
     }
 
@@ -4037,11 +4145,12 @@ class VideoService {
       console.log(`📊 [MediaConvert Telemetry] Job ${jobId} (Topic ${topicId}): Queue Wait (T_queue): ${queueWaitSeconds ?? 'N/A'}s, Encode Duration (T_encode): ${encodingDurationSeconds ?? 'N/A'}s, Total (T_total): ${totalDurationSeconds ?? 'N/A'}s`);
     }
 
-    let dbTopic = null;
-    try {
-      const { data: dt } = await supabase.from('topics').select('*').eq('id', topicId).maybeSingle();
-      dbTopic = dt;
-    } catch (e) {}
+    if (!dbTopic) {
+      try {
+        const { data: dt } = await supabase.from('topics').select('*').eq('id', topicId).maybeSingle();
+        dbTopic = dt;
+      } catch (e) {}
+    }
 
     // Check lesson_videos for authoritative hls_prefix of this specific transcoding run
     let activeLessonVideo = null;
