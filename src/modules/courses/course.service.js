@@ -426,7 +426,9 @@ class CourseService {
     const thumbValue = updateData.thumbnail_url !== undefined ? updateData.thumbnail_url : updateData.image_url;
     if (thumbValue !== undefined) {
       payload.image_url = thumbValue;
+      payload.thumbnail_url = thumbValue; // keep both columns in sync
     }
+
 
     const { data: updated, error } = await supabase
       .from('courses')
