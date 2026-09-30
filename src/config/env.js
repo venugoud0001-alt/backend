@@ -5,6 +5,29 @@ const dotenv = require('dotenv');
 dotenv.config({ path: path.join(__dirname, '../../.env') });
 dotenv.config({ path: path.join(__dirname, '../../../.env') });
 
+// Always kept, even if ALLOWED_STREAMING_ORIGINS in .env is edited later.
+const REQUIRED_STREAMING_ORIGINS = [
+  'https://internnetra.com',
+  'https://www.internnetra.com',
+  'https://api.internnetra.com',
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:3002',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
+  'http://127.0.0.1:3002',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173'
+];
+
+function streamingOrigins() {
+  const fromEnv = String(process.env.ALLOWED_STREAMING_ORIGINS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  return [...new Set([...REQUIRED_STREAMING_ORIGINS, ...fromEnv])];
+}
+
 const requiredEnv = [
   'SUPABASE_URL',
   'SUPABASE_SERVICE_ROLE_KEY',
@@ -68,8 +91,5 @@ module.exports = {
   // Video Security & Session Control (Levels 1-3)
   VIDEO_ACCESS_TTL_SECONDS: Number(process.env.VIDEO_ACCESS_TTL_SECONDS || 900), // Default: 15 minutes
   MAX_CONCURRENT_VIDEO_SESSIONS: Number(process.env.MAX_CONCURRENT_VIDEO_SESSIONS || 2),
-  ALLOWED_STREAMING_ORIGINS: (process.env.ALLOWED_STREAMING_ORIGINS || 'https://internnetra.com,https://www.internnetra.com,http://localhost:3000,http://localhost:5173')
-    .split(',')
-    .map(o => o.trim())
-    .filter(Boolean)
+  ALLOWED_STREAMING_ORIGINS: streamingOrigins()
 };
