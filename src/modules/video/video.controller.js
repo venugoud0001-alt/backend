@@ -331,9 +331,12 @@ class VideoController {
         return errorResponse(res, 'courseId and lessonId parameters are required.', 400);
       }
 
+      const origin = String(req.headers.origin || '');
+      const preferProxy = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
       const authData = await videoService.authorizeStudentPlayback(req.user, {
         courseId,
-        lessonId
+        lessonId,
+        preferProxy
       });
 
       // Set CloudFront Signed Cookies on response
@@ -902,10 +905,13 @@ class VideoController {
   async getTopicPlaybackAuthorization(req, res, next) {
     try {
       const { courseId, moduleId, topicId } = req.params;
+      const origin = String(req.headers.origin || '');
+      const preferProxy = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
       const result = await videoService.authorizeTopicPlayback(req.user, {
         courseId,
         moduleId,
-        topicId
+        topicId,
+        preferProxy
       });
       return successResponse(res, result, 200, 'Topic playback authorized.');
     } catch (err) {
@@ -1111,12 +1117,15 @@ class VideoController {
         });
       }
 
-      // Topic-level ownership verification
+      // Topic-level ownership verification.
+      // playbackTopicKey covers files saved under top_{module}_{slot} before the topic UUID existed.
       if (verifiedToken.topicId && pathTopicId) {
         const tokenTopicId = String(verifiedToken.topicId).toLowerCase();
+        const playbackTopicKey = String(verifiedToken.playbackTopicKey || '').toLowerCase();
         const normPathTopicId = pathTopicId.toLowerCase();
+        const topicKeyAllowed = tokenTopicId === normPathTopicId || (playbackTopicKey && playbackTopicKey === normPathTopicId);
 
-        if (tokenTopicId !== normPathTopicId) {
+        if (!topicKeyAllowed) {
           try {
             const topicClass = classifyIdentifier(pathTopicId);
             let pathTopic = null;
@@ -1216,8 +1225,23 @@ class VideoController {
       if (s3Key.endsWith('.m3u8')) {
         let rawContent = await s3Res.Body.transformToString();
 
-        // If token is present, append token to child playlists and TS segment URLs in manifest
+        // Keep child files on this proxy. Absolute CDN links would be blocked by browser CORS.
         if (token) {
+          const manifestDir = s3Key.split('/').slice(0, -1);
+          rawContent = rawContent.replace(/^(https?:\/\/\S+)$/gm, (line) => {
+            try {
+              const parsed = new URL(line);
+              const childKey = decodeURIComponent(parsed.pathname).replace(/^\/+/, '');
+              if (!childKey.startsWith('courses/') || !/\.(m3u8|ts)$/i.test(childKey)) return line;
+              const childParts = childKey.split('/');
+              let shared = 0;
+              while (shared < manifestDir.length && manifestDir[shared] === childParts[shared]) shared += 1;
+              const relative = [...Array(manifestDir.length - shared).fill('..'), ...childParts.slice(shared)].join('/');
+              return relative || line;
+            } catch (e) {
+              return line;
+            }
+          });
           rawContent = rawContent.replace(/^([^#\r\n].*\.(m3u8|ts))$/gm, (match) => {
             const delim = match.includes('?') ? '&' : '?';
             return `${match}${delim}token=${token}`;

@@ -1640,6 +1640,9 @@ class CurriculumService {
       return remSec > 0 ? `${mins} min ${remSec}s` : `${mins} min`;
     };
 
+    const { hlsUrlNamesTopic, recoverFinishedTopicMasters } = require('../video/video.topic-hls-resolve');
+    let recoveredTopicMasters = new Map();
+
     // Helper to format JSON curriculum_modules if present
     const formatJsonCurriculum = (jsonModules) => {
       const sortedJsonModules = [...(jsonModules || [])].sort(sortModuleFn);
@@ -1891,6 +1894,26 @@ class CurriculumService {
               if (byLesson) { readyLv = byLesson; break; }
             }
             // source_video_id only if that asset is owned by this topic
+            // Older uploads were saved as top_{moduleNumber}_{slot} before topics had UUIDs.
+            // Attach that file only when this exact slot has one READY video and the topic has none of its own.
+            if (!readyLv) {
+              const slot = Number(tOrder || (tIdx + 1));
+              const titleNum = String(m.title || m.name || '').match(/(?:module|mod|m)\s*(\d+)/i);
+              const slotModuleNum = titleNum ? titleNum[1] : modNumStr;
+              if (slot > 0 && slotModuleNum) {
+                const syntheticId = `top_${slotModuleNum}_${slot}`;
+                const slotVideos = [
+                  ...(videosByTopicId.get(syntheticId) || []),
+                  ...(videosByLessonId.get(syntheticId) || [])
+                ].filter((v) => {
+                  if (String(v?.status || '').toUpperCase() !== 'READY' || !v?.hls_master_url) return false;
+                  const videoModule = String(v.module_id || '');
+                  return !videoModule || videoModule === slotModuleNum || videoModule === modIdStr;
+                });
+                const uniqueSlotVideos = [...new Map(slotVideos.map((v) => [String(v.id), v])).values()];
+                if (uniqueSlotVideos.length === 1) readyLv = uniqueSlotVideos[0];
+              }
+            }
             if (!readyLv) {
               const sourceKeys = [
                 mt?.source_video_id,
@@ -1915,17 +1938,29 @@ class CurriculumService {
 
             const rawStatus = isExplicitlyNoVideo
               ? 'DRAFT'
-              : (mt?.processing_status || null);
-            // Mode 2: do not trust curriculum JSON HLS alone (can be polluted from another topic)
+              : (mt?.processing_status || (isObj ? t.processing_status : null) || null);
+            const jsonHls = isObj ? (t.hls_master_url || t.video_url || '') : '';
+            const topicIdentity = String(
+              (!isSyntheticTopicId(mt?.id) ? mt?.id : null) ||
+              (!isSyntheticTopicId(tId) ? tId : null) ||
+              ''
+            );
+            const jsonNamesThisTopic = hlsUrlNamesTopic(jsonHls, topicIdentity);
+            const recovered = recoveredTopicMasters.get(topicIdentity) || null;
+            // Keep a playlist only when it names this topic. A copied module URL is not ownership.
             const rawHls = isExplicitlyNoVideo
               ? null
-              : (mt?.hls_master_url || (!isMode2Module && isObj ? t.hls_master_url : null) || null);
+              : (mt?.hls_master_url || (jsonNamesThisTopic ? jsonHls : null) || recovered?.hlsMasterUrl || (!isMode2Module && isObj ? t.hls_master_url : null) || null);
 
             const topicOwnsReady = Boolean(readyLv) || Boolean(
-              rawHls && String(rawStatus || '').toUpperCase() === 'READY'
+              rawHls && (
+                String(rawStatus || '').toUpperCase() === 'READY' ||
+                jsonNamesThisTopic ||
+                Boolean(recovered)
+              )
             );
 
-            const effectiveStatus = (!isExplicitlyNoVideo && readyLv && (!rawHls || String(rawStatus || '').toUpperCase() !== 'READY'))
+            const effectiveStatus = (!isExplicitlyNoVideo && topicOwnsReady)
               ? 'READY'
               : (isMode2Module && !topicOwnsReady
                 ? 'DRAFT'
@@ -2075,6 +2110,7 @@ class CurriculumService {
     let publishedVersion = null;
 
     if (Array.isArray(course.curriculum_modules) && course.curriculum_modules.length > 0) {
+      recoveredTopicMasters = await recoverFinishedTopicMasters(course, course.curriculum_modules, sortModuleFn);
       formattedModules = formatJsonCurriculum(course.curriculum_modules);
     } else {
       const versions = await this.getVersionsByCourse(course.id);

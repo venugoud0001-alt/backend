@@ -43,6 +43,7 @@ const defaultProductionOrigins = [
   'https://api.internnetra.com'
 ];
 
+// Local dashboard origins (3000 and 3002) are listed in CORS_ALLOWED_ORIGINS.
 const envOrigins = env.CORS_ALLOWED_ORIGINS
   ? env.CORS_ALLOWED_ORIGINS.split(',').map(o => o.trim().replace(/\/+$/, '')).filter(Boolean)
   : [];
@@ -59,10 +60,14 @@ const productionAllowlist = new Set([
 
 const normalizeOrigin = (origin) => String(origin || '').trim().replace(/\/+$/, '');
 
+const localDevEnabled = envOrigins.some((origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin));
+
 const isAllowedOrigin = (origin) => {
   const normalized = normalizeOrigin(origin);
   if (!normalized) return false;
   if (productionAllowlist.has(normalized)) return true;
+  // If local dashboard origins are allowlisted, accept any localhost port (3000, 3001, 3002, ...).
+  if (localDevEnabled && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(normalized)) return true;
   // Case-insensitive host match for allowlisted production domains
   try {
     const { protocol, host } = new URL(normalized);
