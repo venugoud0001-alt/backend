@@ -1,68 +1,46 @@
-const fs = require('fs');
 const path = require('path');
 const { supabase } = require('../../config/supabase');
-
-const saveLocalFile = (storageKey, fileBuffer) => {
-  try {
-    const cleanKey = storageKey.replace(/^uploads\//, '');
-    const targetPath = path.join(__dirname, '../../../uploads', cleanKey);
-    const targetDir = path.dirname(targetPath);
-    if (!fs.existsSync(targetDir)) {
-      fs.mkdirSync(targetDir, { recursive: true });
-    }
-    fs.writeFileSync(targetPath, fileBuffer);
-  } catch (e) {
-    console.error("Local file save error:", e.message);
-  }
-};
+const env = require('../../config/env');
 
 class SupabaseStorageProvider {
-  constructor(bucketName = 'course-content') {
+  constructor(bucketName = env.SUPABASE_STORAGE_BUCKET || 'course-assets') {
     this.bucketName = bucketName;
   }
 
   /**
-   * Upload file to Supabase Storage with graceful local fallback
+   * Upload file strictly to Supabase Storage (public course-assets bucket)
+   * Permanent cloud storage that never expires or wipes on server restarts
    */
-  async upload(fileBuffer, storageKey, mimeType = 'video/mp4') {
-    try {
-      const { data, error } = await supabase.storage
-        .from(this.bucketName)
-        .upload(storageKey, fileBuffer, {
-          contentType: mimeType,
-          upsert: true
-        });
-
-      if (error) {
-        if (error.message && error.message.includes('Bucket not found')) {
-          saveLocalFile(storageKey, fileBuffer);
-          const cleanKey = storageKey.replace(/^uploads\//, '');
-          return {
-            storage_provider: 'LOCAL',
-            storage_key: storageKey,
-            video_url: `/uploads/${cleanKey}`
-          };
-        }
-        throw new Error(`Supabase Storage upload error: ${error.message}`);
-      }
-
-      return {
-        storage_provider: 'SUPABASE',
-        storage_key: data.path,
-        video_url: this.getUrl(data.path)
-      };
-    } catch (err) {
-      if (err.message && err.message.includes('Bucket not found')) {
-        saveLocalFile(storageKey, fileBuffer);
-        const cleanKey = storageKey.replace(/^uploads\//, '');
-        return {
-          storage_provider: 'LOCAL',
-          storage_key: storageKey,
-          video_url: `/uploads/${cleanKey}`
-        };
-      }
-      throw err;
+  async upload(fileBuffer, storageKey, mimeType = 'image/webp') {
+    if (!fileBuffer || !Buffer.isBuffer(fileBuffer)) {
+      throw new Error('Supabase Storage: Valid fileBuffer is required for upload.');
     }
+    const cleanStorageKey = String(storageKey || '').replace(/^\/+/, '');
+    if (!cleanStorageKey) {
+      throw new Error('Supabase Storage: Storage key must not be empty.');
+    }
+
+    const { data, error } = await supabase.storage
+      .from(this.bucketName)
+      .upload(cleanStorageKey, fileBuffer, {
+        contentType: mimeType,
+        upsert: true
+      });
+
+    if (error) {
+      console.error(`[SupabaseStorageProvider] Upload failed to bucket '${this.bucketName}':`, error.message);
+      throw new Error(`Supabase Storage upload error (${this.bucketName}): ${error.message}`);
+    }
+
+    const publicUrl = this.getUrl(data.path || cleanStorageKey);
+
+    return {
+      storage_provider: 'SUPABASE',
+      storage_key: data.path || cleanStorageKey,
+      video_url: publicUrl,
+      imageUrl: publicUrl,
+      publicUrl: publicUrl
+    };
   }
 
   /**
@@ -73,7 +51,8 @@ class SupabaseStorageProvider {
     if (storageKey.startsWith('http://') || storageKey.startsWith('https://')) {
       return storageKey;
     }
-    const { data } = supabase.storage.from(this.bucketName).getPublicUrl(storageKey);
+    const cleanKey = storageKey.replace(/^\/+/, '');
+    const { data } = supabase.storage.from(this.bucketName).getPublicUrl(cleanKey);
     return data?.publicUrl || '';
   }
 

@@ -56,6 +56,8 @@ module.exports = {
   CASHFREE_CLIENT_SECRET: process.env.CASHFREE_CLIENT_SECRET,
   CASHFREE_ENV: process.env.CASHFREE_ENV || 'PRODUCTION',
   CASHFREE_WEBHOOK_URL: process.env.CASHFREE_WEBHOOK_URL || 'https://api.internnetra.com/api/webhooks/cashfree',
+  STORAGE_PROVIDER: process.env.STORAGE_PROVIDER || 'SUPABASE',
+  SUPABASE_STORAGE_BUCKET: process.env.SUPABASE_STORAGE_BUCKET || 'course-assets',
   JWT_SECRET: process.env.JWT_SECRET,
   SMTP_HOST: process.env.SMTP_HOST || 'smtp.gmail.com',
   SMTP_PORT: Number(process.env.SMTP_PORT || 465),
